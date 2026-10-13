@@ -484,6 +484,11 @@ async function sync() {
   setSync('syncing');
   try {
     if (!cfg.gistId) {
+      // reuse an existing Canopy gist (e.g. made by your other device) before creating one
+      const existing = (await gh('/gists?per_page=100')).find(g => g.files?.[FILE]);
+      if (existing) { cfg.gistId = existing.id; saveCfg(); }
+    }
+    if (!cfg.gistId) {
       const g = await gh('/gists', {
         method: 'POST',
         body: JSON.stringify({ description: 'Canopy · todo data', public: false, files: { [FILE]: { content: serialize(data) } } }),
@@ -851,6 +856,7 @@ function openSettings() {
   $('#aiOn').checked = cfg.aiOn;
   showProviderFields();
   $('#setupCode').value = '';
+  $('#setupStatus').hidden = true;
   $('#testOut').hidden = true;
   fillModelSelect([], cfg.aiModel);
   dlg.showModal();
@@ -895,10 +901,49 @@ $('#testAI').addEventListener('click', async () => {
 });
 
 $('#copySetup').addEventListener('click', async () => {
-  const code = btoa(JSON.stringify({ ghToken: $('#ghToken').value.trim(), gistId: $('#gistId').value.trim() || cfg.gistId, ...formAi() }));
-  try { await navigator.clipboard.writeText(code); toast('Setup code copied'); }
+  const ghToken = $('#ghToken').value.trim();
+  const code = btoa(JSON.stringify({ ghToken, gistId: $('#gistId').value.trim() || cfg.gistId, ...formAi() }));
+  const note = ghToken ? 'Setup code copied' : 'Copied, but it has no GitHub token, so the other device won’t sync';
+  try { await navigator.clipboard.writeText(code); toast(note); }
   catch { $('#setupCode').value = code; $('#setupCode').select(); toast('Copy the code from the field'); }
 });
+
+function decodeSetup(code) {
+  try {
+    const c = JSON.parse(atob(code.replace(/\s+/g, '')));
+    return c && typeof c === 'object' && ('ghToken' in c || 'claudeKey' in c || 'aiKey' in c) ? c : null;
+  } catch { return null; }
+}
+
+// fill the form from a pasted setup code and say what it contained
+function applySetupCode(code) {
+  const status = $('#setupStatus');
+  status.hidden = !code;
+  if (!code) return true;
+  const c = decodeSetup(code);
+  if (!c) {
+    status.innerHTML = '<span class="bad">✗ That doesn’t look like a setup code. Copy it again from your other device.</span>';
+    return false;
+  }
+  if (c.ghToken) $('#ghToken').value = c.ghToken;
+  if (c.gistId) $('#gistId').value = c.gistId;
+  if (c.provider) $('#provider').value = c.provider;
+  if (c.claudeKey) $('#claudeKey').value = c.claudeKey;
+  if (c.aiKey) $('#aiKey').value = c.aiKey;
+  if (c.aiModel) fillModelSelect([], c.aiModel);
+  if (typeof c.aiOn === 'boolean') $('#aiOn').checked = c.aiOn;
+  showProviderFields();
+
+  const mark = (ok, label) => `<span class="${ok ? 'ok' : 'bad'}">${ok ? '✓' : '✗'} ${label}</span>`;
+  const aiKeyIn = c.provider === 'gemini' ? c.aiKey : c.claudeKey;
+  status.innerHTML = [
+    mark(!!c.ghToken, c.ghToken ? 'GitHub sync' : 'no GitHub token (set up sync on the other device first)'),
+    mark(!!aiKeyIn, aiKeyIn ? `${c.provider === 'gemini' ? 'Gemini' : 'Claude'} key` : 'no AI key'),
+  ].join(' · ') + '<br>Now tap <b>save</b>.';
+  return true;
+}
+
+$('#setupCode').addEventListener('input', e => applySetupCode(e.target.value.trim()));
 
 $('#exportData').addEventListener('click', () => {
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -922,20 +967,17 @@ $('#importFile').addEventListener('change', async e => {
 
 $('#settingsForm').addEventListener('submit', e => {
   e.preventDefault();
-  const code = $('#setupCode').value.trim();
-  let next = {
+  if (!applySetupCode($('#setupCode').value.trim())) return;
+  const next = {
     ghToken: $('#ghToken').value.trim(),
     gistId: ($('#gistId').value.trim().match(/[0-9a-f]{20,}/i) || [''])[0],
     ...formAi(),
   };
-  if (code) {
-    try { next = { ...next, ...JSON.parse(atob(code)) }; }
-    catch { toast('That setup code didn’t work'); return; }
-  }
   const tokenChanged = next.ghToken !== cfg.ghToken || next.gistId !== cfg.gistId;
   cfg = { ...cfg, ...next };
   saveCfg();
   dlg.close();
+  toast(cfg.ghToken ? 'Saved · syncing…' : 'Saved');
   setAiStatus('');
   render();
   if (tokenChanged) dirty = true;

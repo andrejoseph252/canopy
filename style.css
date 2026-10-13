@@ -370,6 +370,9 @@ dialog::backdrop { background: var(--backdrop); -webkit-backdrop-filter: blur(4p
 .dlg .check-row { flex-direction: row; align-items: center; gap: 10px; font-family: var(--sans); font-size: 14px; letter-spacing: 0; text-transform: none; color: var(--text); }
 .dlg .check-row input { width: 18px; height: 18px; accent-color: var(--accent); }
 .dlg select { flex: 1; min-width: 0; }
+.dlg .setup-status { color: var(--text); }
+.dlg .setup-status .ok { color: var(--accent); }
+.dlg .setup-status .bad { color: var(--amber); }
 .dlg .sub { display: flex; flex-direction: column; gap: 12px; }
 .dlg .sub[hidden] { display: none; }
 .btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
