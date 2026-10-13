@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Canopy</title>
+  <meta name="description" content="Throw things in. They sort themselves.">
+  <meta name="theme-color" content="#0a100e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Canopy">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script>
+    // apply the saved theme before first paint so it doesn't flash
+    (function () {
+      var t = 'system';
+      try { t = localStorage.getItem('canopy:theme') || 'system'; } catch (e) {}
+      if (t === 'system') t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      document.documentElement.dataset.theme = t;
+    })();
+  </script>
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M16 28V15" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+          <path d="M16 17c0-6 4-10 10-11 0 6-4 10-10 11z" fill="currentColor"/>
+          <path d="M16 20c0-5-3-8-8-9 0 5 3 8 8 9z" fill="currentColor" opacity=".65"/>
+        </svg>
+        <span>canopy</span>
+      </div>
+      <div class="top-right">
+        <button id="sync" class="sync" data-state="local" title="Sync now"><i></i><span>local only</span></button>
+        <button id="openSettings" class="icon-btn" aria-label="Settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <form id="capture" class="capture" autocomplete="off">
+      <textarea id="captureInput" rows="1" placeholder="throw something in…" enterkeyhint="send" aria-label="Capture"></textarea>
+      <button type="submit" aria-label="Add">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+      </button>
+    </form>
+    <div class="hint" id="hint"></div>
+
+    <nav id="chips" class="chips" aria-label="Views"></nav>
+    <main id="list"></main>
+  </div>
+
+  <datalist id="groups"></datalist>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <dialog id="settings">
+    <form method="dialog" class="dlg" id="settingsForm">
+      <div class="dlg-head">
+        <h2>Settings</h2>
+        <button type="button" class="icon-btn" data-close aria-label="Close">✕</button>
+      </div>
+
+      <fieldset>
+        <legend>Appearance</legend>
+        <div class="seg" id="themePicker" role="radiogroup" aria-label="Theme">
+          <button type="button" data-theme-choice="system" role="radio">system</button>
+          <button type="button" data-theme-choice="dark" role="radio">dark</button>
+          <button type="button" data-theme-choice="light" role="radio">light</button>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Sync · GitHub Gist</legend>
+        <label>GitHub token <input id="ghToken" type="password" autocomplete="off" spellcheck="false" placeholder="ghp_…"></label>
+        <label>Gist ID <input id="gistId" autocomplete="off" spellcheck="false" placeholder="leave empty to create one"></label>
+        <p class="help">A classic token with only the <code>gist</code> scope. On your other device, enter the same token and Gist ID, or use a setup code (see below).</p>
+      </fieldset>
+
+      <fieldset>
+        <legend>AI sorting</legend>
+        <label class="check-row"><input type="checkbox" id="aiOn"> <span>Sort captures with AI</span></label>
+        <label>Provider
+          <select id="provider">
+            <option value="claude">Claude Haiku 5.5 · fast, about $0.0002 per capture</option>
+            <option value="gemini">Gemini · free tier</option>
+          </select>
+        </label>
+
+        <div class="sub" id="claudeFields">
+          <label>Claude API key <input id="claudeKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…"></label>
+          <p class="help">Create one at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>, and set a monthly spend limit there.</p>
+        </div>
+
+        <div class="sub" id="geminiFields">
+          <label>Gemini API key <input id="aiKey" type="password" autocomplete="off" spellcheck="false" placeholder="from aistudio.google.com"></label>
+          <div class="field">
+            <span class="lbl">Model</span>
+            <div class="row">
+              <select id="aiModel"></select>
+              <button type="button" class="btn" id="loadModels">load list</button>
+            </div>
+          </div>
+          <p class="help">Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>.</p>
+        </div>
+
+        <div class="btn-row"><button type="button" class="btn" id="testAI">test it</button></div>
+        <pre id="testOut" class="test" hidden></pre>
+        <p class="help">Keys are stored only in this browser.</p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Devices &amp; data</legend>
+        <div class="btn-row">
+          <button type="button" class="btn" id="copySetup">copy setup code</button>
+          <button type="button" class="btn" id="exportData">export json</button>
+          <button type="button" class="btn" id="importBtn">import json</button>
+          <input type="file" id="importFile" accept="application/json,.json" hidden>
+        </div>
+        <label>Setup code from another device <input id="setupCode" autocomplete="off" spellcheck="false" placeholder="paste here, then save"></label>
+        <p class="help">The setup code contains your keys, so only paste it somewhere private, like AirDrop or a note to yourself.</p>
+      </fieldset>
+
+      <div class="btn-row end">
+        <button type="button" class="btn" data-close>cancel</button>
+        <button type="submit" value="save" class="btn primary">save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
