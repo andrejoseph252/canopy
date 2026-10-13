@@ -1,6 +1,6 @@
 // Offline support: network-first for the app's own files, so updates show up
 // right away when online and the last version still loads when offline.
-const CACHE = 'canopy-v3';
+const CACHE = 'canopy-v4';
 const ASSETS = ['./', './index.html', './style.css', './app.js', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {

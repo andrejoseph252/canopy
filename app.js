@@ -565,13 +565,16 @@ function card(it, showGroup) {
   if (fresh.has(it.id)) cls.push('fresh');
   if (openId === it.id) cls.push('open');
 
-  return `<li class="${cls.join(' ')}" data-id="${esc(it.id)}" style="--kc:var(--k-${esc(it.kind)})">
-    <button class="check" data-act="toggle" aria-label="${it.done ? 'Mark not done' : 'Mark done'}"></button>
-    <div class="body" data-act="open">
-      <div class="title">${esc(it.title)}</div>
-      <div class="meta">${meta.join('')}</div>
+  return `<li class="swipe-row" data-id="${esc(it.id)}" style="--kc:var(--k-${esc(it.kind)})">
+    <div class="swipe-bg" aria-hidden="true"><span class="sb-done">${it.done ? '↺ not done' : '✓ done'}</span><span class="sb-del">delete ✕</span></div>
+    <div class="${cls.join(' ')}">
+      <button class="check" data-act="toggle" aria-label="${it.done ? 'Mark not done' : 'Mark done'}"></button>
+      <div class="body" data-act="open">
+        <div class="title">${esc(it.title)}</div>
+        <div class="meta">${meta.join('')}</div>
+      </div>
+      ${openId === it.id ? editor(it) : ''}
     </div>
-    ${openId === it.id ? editor(it) : ''}
   </li>`;
 }
 
@@ -658,7 +661,14 @@ function renderChips() {
   $('#groups').innerHTML = groups.map(g => `<option value="${esc(g)}">`).join('');
 }
 
+const isTouch = matchMedia('(pointer: coarse)').matches;
+
 function renderHint() {
+  // on phones, only show the line when there's something to say
+  if (isTouch) {
+    $('#hint').innerHTML = aiStatus ? `<span class="${aiStatus.warn ? 'warn' : ''}">${esc(aiStatus.msg)}</span>` : '';
+    return;
+  }
   const base = 'enter to add · shift+enter for new line · #tags · “tomorrow”, “by fri”';
   let ai;
   if (aiStatus) ai = `<span class="${aiStatus.warn ? 'warn' : ''}">${esc(aiStatus.msg)}</span>`;
@@ -708,6 +718,27 @@ $('#themePicker').addEventListener('click', e => {
   if (b) setTheme(b.dataset.themeChoice);
 });
 
+/* ---------- haptics ---------- */
+
+// iOS Safari has no vibrate API, but toggling a native switch gives a light tap (iOS 18+)
+const hapticLabel = (() => {
+  const label = document.createElement('label');
+  label.setAttribute('aria-hidden', 'true');
+  label.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;pointer-events:none';
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.setAttribute('switch', '');
+  box.tabIndex = -1;
+  label.appendChild(box);
+  document.body.appendChild(label);
+  return label;
+})();
+
+function haptic() {
+  if (navigator.vibrate) { navigator.vibrate(8); return; }
+  if (isTouch) hapticLabel.click();
+}
+
 /* ---------- toast ---------- */
 
 let toastTimer;
@@ -744,7 +775,29 @@ $('#chips').addEventListener('click', e => {
   if (b) setView(b.dataset.view);
 });
 
+function completeItem(id, row) {
+  const it = data.items[id];
+  if (!it) return;
+  haptic();
+  if (!it.done) {
+    row?.classList.add('leaving');
+    setTimeout(() => update(id, { done: true, doneAt: now() }), row ? 420 : 0);
+    toast('Done', () => update(id, { done: false, doneAt: null }));
+  } else {
+    update(id, { done: false, doneAt: null });
+  }
+}
+
+function deleteItem(id) {
+  if (openId === id) openId = null;
+  update(id, { deleted: true, pending: null });
+  toast('Deleted', () => update(id, { deleted: false }));
+}
+
+let suppressClick = false;
+
 $('#list').addEventListener('click', e => {
+  if (suppressClick) return;
   const el = e.target.closest('[data-act]');
   if (!el) return;
   const li = el.closest('[data-id]');
@@ -759,16 +812,9 @@ $('#list').addEventListener('click', e => {
       openId = openId === id ? null : id;
       renderList();
       return;
-    case 'toggle': {
-      if (!it.done) {
-        li.classList.add('leaving');
-        setTimeout(() => update(id, { done: true, doneAt: now() }), 420);
-        toast('Done', () => update(id, { done: false, doneAt: null }));
-      } else {
-        update(id, { done: false, doneAt: null });
-      }
+    case 'toggle':
+      completeItem(id, li);
       return;
-    }
     case 'kind': {
       const kind = el.dataset.kind;
       if (kind === it.kind) return;
@@ -779,14 +825,82 @@ $('#list').addEventListener('click', e => {
       update(id, { kind }, true);
       return;
     }
-    case 'delete': {
-      openId = null;
-      update(id, { deleted: true, pending: null });
-      toast('Deleted', () => update(id, { deleted: false }));
+    case 'delete':
+      deleteItem(id);
       return;
-    }
   }
 });
+
+/* ---------- swipe gestures (touch): right = done, left = delete ---------- */
+
+const SWIPE_AT = 90;
+let drag = null;
+
+const settle = (card, row) => {
+  card.style.transition = 'transform .25s cubic-bezier(.2, .8, .2, 1)';
+  card.style.transform = '';
+  delete row.dataset.swipe;
+  row.classList.remove('armed', 'swiping');
+};
+
+$('#list').addEventListener('pointerdown', e => {
+  if (e.pointerType === 'mouse' || drag) return;
+  const card = e.target.closest('.item');
+  const row = card?.closest('.swipe-row');
+  if (!row || row.dataset.id === openId || e.target.closest('input, textarea, a')) return;
+  drag = { row, card, id: e.pointerId, x: e.clientX, y: e.clientY, dx: 0, active: false, armed: false };
+});
+
+$('#list').addEventListener('pointermove', e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const dx = e.clientX - drag.x;
+  const dy = e.clientY - drag.y;
+  if (!drag.active) {
+    if (Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) { drag = null; return; }
+    if (Math.abs(dx) < 10) return;
+    drag.active = true;
+    try { drag.card.setPointerCapture(e.pointerId); } catch {}
+    drag.row.classList.add('swiping');
+    drag.card.style.transition = 'none';
+  }
+  drag.dx = dx;
+  // follow the finger, then resist past the trigger point
+  const mag = Math.abs(dx);
+  const eased = mag <= 140 ? mag : 140 + (mag - 140) * 0.3;
+  drag.card.style.transform = `translateX(${Math.sign(dx) * eased}px)`;
+  drag.row.dataset.swipe = dx > 0 ? 'right' : 'left';
+  const armed = mag > SWIPE_AT;
+  if (armed !== drag.armed) {
+    drag.armed = armed;
+    drag.row.classList.toggle('armed', armed);
+    if (armed) haptic();
+  }
+});
+
+function endDrag(e) {
+  if (!drag || e.pointerId !== drag.id) return;
+  const d = drag;
+  drag = null;
+  if (!d.active) return;
+  suppressClick = true;
+  setTimeout(() => { suppressClick = false; }, 60);
+
+  if (!(d.armed && e.type === 'pointerup')) { settle(d.card, d.row); return; }
+  const id = d.row.dataset.id;
+  d.card.style.transition = 'transform .22s ease-in';
+  d.card.style.transform = `translateX(${d.dx > 0 ? '' : '-'}110%)`;
+  setTimeout(() => {
+    if (d.dx > 0) {
+      const it = data.items[id];
+      if (it && !it.done) { update(id, { done: true, doneAt: now() }); toast('Done', () => update(id, { done: false, doneAt: null })); }
+      else update(id, { done: false, doneAt: null });
+    } else {
+      deleteItem(id);
+    }
+  }, 200);
+}
+$('#list').addEventListener('pointerup', endDrag);
+$('#list').addEventListener('pointercancel', endDrag);
 
 $('#list').addEventListener('change', e => {
   const el = e.target.closest('[data-field]');
@@ -808,6 +922,15 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && openId && !$('#settings').open) { openId = null; renderList(); }
   if (e.key === '/' && document.activeElement === document.body) { e.preventDefault(); input.focus(); }
 });
+
+/* ---------- header ---------- */
+
+const scroller = $('#scroller');
+scroller.addEventListener('scroll', () => {
+  $('#appbar').classList.toggle('scrolled', scroller.scrollTop > 4);
+}, { passive: true });
+// the page doesn't scroll, so iOS's tap-the-status-bar shortcut can't reach the list; the logo does it instead
+$('#brand').addEventListener('click', () => scroller.scrollTo({ top: 0, behavior: 'smooth' }));
 
 /* ---------- events: sync triggers ---------- */
 
