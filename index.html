@@ -16,19 +16,31 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <script>
-    // apply the saved theme before first paint so it doesn't flash
     (function () {
+      var root = document.documentElement;
+
+      // apply the saved theme before first paint so it doesn't flash
       var t = 'system';
       try { t = localStorage.getItem('canopy:theme') || 'system'; } catch (e) {}
       if (t === 'system') t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-      document.documentElement.dataset.theme = t;
-      // iOS reads this at launch: dark draws edge to edge under the status bar,
-      // light uses the standard bar so its white text stays readable
-      var m = document.createElement('meta');
-      m.name = 'apple-mobile-web-app-status-bar-style';
-      m.content = t === 'light' ? 'default' : 'black-translucent';
-      document.head.appendChild(m);
+      root.dataset.theme = t;
+
+      // home-screen app: iOS can report a viewport shorter than the screen when drawing
+      // under the status bar, which leaves an uncovered strip at the bottom.
+      // Size the app to the physical screen instead.
+      var standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+      if (!standalone) return;
+      root.classList.add('standalone');
+      function size() {
+        var portrait = innerHeight >= innerWidth;
+        var h = portrait ? Math.max(screen.height, screen.width) : Math.min(screen.height, screen.width);
+        root.style.setProperty('--app-h', Math.max(h, innerHeight) + 'px');
+      }
+      size();
+      addEventListener('resize', size);
+      addEventListener('orientationchange', function () { setTimeout(size, 300); });
     })();
   </script>
 </head>

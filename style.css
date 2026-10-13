@@ -35,6 +35,12 @@
   --backdrop: rgba(3, 6, 5, .7);
 
   --radius: 14px;
+
+  /* top/bottom insets; home-screen mode guarantees room for the status bar + Dynamic Island */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --top-cushion: 14px;
+  --app-h: 100%;
   --sans: 'Space Grotesk', system-ui, -apple-system, sans-serif;
   --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 }
@@ -81,9 +87,15 @@
 * { box-sizing: border-box; }
 html { color-scheme: dark; -webkit-text-size-adjust: 100%; }
 
+html.standalone {
+  --safe-top: max(env(safe-area-inset-top, 0px), 54px);
+  --safe-bottom: max(env(safe-area-inset-bottom, 0px), 20px);
+  --top-cushion: 22px;
+}
+
 /* app shell: the page itself never scrolls or bounces; only the list does */
 html, body {
-  height: 100%;
+  height: var(--app-h);
   overflow: hidden;
   overscroll-behavior: none;
   background: var(--bg);
@@ -100,7 +112,9 @@ body {
 /* full-bleed background, including behind the status bar and home indicator */
 .backdrop {
   position: fixed;
-  inset: 0;
+  top: 0; left: 0; right: 0;
+  /* overshoot so nothing below the reported viewport is left uncovered */
+  height: calc(var(--app-h) + 120px);
   pointer-events: none;
   background:
     radial-gradient(1100px 600px at 85% -10%, var(--glow-a), transparent 60%),
@@ -136,14 +150,15 @@ code { font-family: var(--mono); font-size: .9em; color: var(--accent); }
 
 .shell {
   position: relative;
-  height: 100%;
+  height: var(--app-h);
   display: flex;
   flex-direction: column;
 }
 
 .appbar {
   flex: none;
-  padding: calc(env(safe-area-inset-top) + 14px) max(16px, env(safe-area-inset-right)) 0 max(16px, env(safe-area-inset-left));
+  position: relative;
+  padding: calc(var(--safe-top) + var(--top-cushion)) max(16px, env(safe-area-inset-right)) 0 max(16px, env(safe-area-inset-left));
   border-bottom: 1px solid transparent;
   transition: border-color .2s, background .2s;
 }
@@ -159,7 +174,7 @@ code { font-family: var(--mono); font-size: .9em; color: var(--accent); }
   overflow-y: auto;
   overscroll-behavior-y: contain;
   -webkit-overflow-scrolling: touch;
-  padding: 6px max(16px, env(safe-area-inset-right)) calc(env(safe-area-inset-bottom) + 48px) max(16px, env(safe-area-inset-left));
+  padding: 6px max(16px, env(safe-area-inset-right)) calc(var(--safe-bottom) + 48px) max(16px, env(safe-area-inset-left));
 }
 
 /* header */
@@ -371,7 +386,7 @@ code { font-family: var(--mono); font-size: .9em; color: var(--accent); }
 
 /* toast */
 .toast {
-  position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 20px); z-index: 10;
+  position: fixed; left: 50%; bottom: calc(var(--safe-bottom) + 20px); z-index: 10;
   display: flex; align-items: center; gap: 16px;
   max-width: calc(100vw - 32px);
   padding: 10px 12px 10px 16px;
@@ -501,8 +516,9 @@ dialog::backdrop { background: var(--backdrop); -webkit-backdrop-filter: blur(4p
 
   /* settings becomes a full-screen sheet below the status bar */
   dialog {
+    position: fixed; inset: 0 auto auto 0;
     width: 100%; max-width: 100%;
-    height: 100%; max-height: 100%;
+    height: var(--app-h); max-height: none;
     margin: 0;
     border: 0; border-radius: 0;
     box-shadow: none;
@@ -510,11 +526,11 @@ dialog::backdrop { background: var(--backdrop); -webkit-backdrop-filter: blur(4p
     overscroll-behavior: contain;
   }
   dialog[open] { animation: sheet-up .34s cubic-bezier(.2, .8, .2, 1); }
-  .dlg { padding: 0 16px calc(env(safe-area-inset-bottom) + 28px); }
+  .dlg { padding: 0 16px calc(var(--safe-bottom) + 28px); }
   .dlg-head {
     position: sticky; top: 0; z-index: 2;
     margin: 0 -16px;
-    padding: calc(env(safe-area-inset-top) + 10px) 16px 12px;
+    padding: calc(var(--safe-top) + var(--top-cushion)) 16px 12px;
     background: color-mix(in srgb, var(--bg2) 88%, transparent);
     -webkit-backdrop-filter: blur(14px);
     backdrop-filter: blur(14px);
@@ -524,3 +540,15 @@ dialog::backdrop { background: var(--backdrop); -webkit-backdrop-filter: blur(4p
 }
 
 @keyframes sheet-up { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* light theme in the home-screen app: iOS status bar text is always white here,
+   so give it a dark band to sit on */
+html.standalone[data-theme=light] .appbar::before,
+html.standalone[data-theme=light] .dlg-head::before {
+  content: '';
+  position: absolute; top: 0; left: 0; right: 0;
+  height: var(--safe-top);
+  background: linear-gradient(180deg, #17261f, #22362c);
+}
+.dlg-head { position: relative; }
+@media (max-width: 600px) { .dlg-head { position: sticky; } }
