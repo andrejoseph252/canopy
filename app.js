@@ -43,6 +43,7 @@ function writeJSON(key, value) {
 let data = readJSON(LS.data, null) || { v: 1, items: {}, examples: [] };
 data.items ||= {};
 data.today ||= {};
+data.focus ||= {};
 data.examples ||= [];
 
 // aiKey / aiModel are the Gemini settings (named before Claude was added)
@@ -100,15 +101,18 @@ const liveToday = () => Object.values(data.today)
 
 function addToday(text, ref = null) {
   const lines = text.split(/\n+/).map(s => s.trim()).filter(Boolean);
-  if (!lines.length) return;
+  if (!lines.length) return [];
   let order = Math.max(-1, ...liveToday().map(e => e.order)) + 1;
   const t = now();
+  const ids = [];
   for (const line of lines) {
     const e = { id: uid(), text: line, done: false, doneAt: null, order: order++, day: todayStr(), ref, created: t, updated: t };
     data.today[e.id] = e;
     freshToday.add(e.id);
+    ids.push(e.id);
   }
   commit();
+  return ids;
 }
 
 function updateToday(id, patch) {
@@ -148,6 +152,12 @@ function rollover() {
   }
   if (moved) commit();
 }
+
+// minutes of focus logged today, overall or for one Today entry
+const focusMinutes = todayId => Object.values(data.focus)
+  .filter(f => !f.deleted && f.day === todayStr() && (!todayId || f.todayId === todayId))
+  .reduce((sum, f) => sum + (f.minutes || 0), 0);
+const fmtMinutes = m => (m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60 ? ` ${m % 60}m` : ''}`);
 
 const briefDismissed = () => { try { return localStorage.getItem(LS.brief); } catch { return null; } };
 
@@ -536,6 +546,7 @@ function merge(a, b) {
     ...b, ...a, v: 1,
     items: mergeMap(a.items, b.items),
     today: mergeMap(a.today, b.today),
+    focus: mergeMap(a.focus, b.focus),
     examples,
     briefing: newer(a.briefing, b.briefing),
   };
@@ -549,6 +560,7 @@ function mapDiffers(from = {}, to = {}) {
 function differs(from, to) {
   return mapDiffers(from.items, to.items)
     || mapDiffers(from.today, to.today)
+    || mapDiffers(from.focus, to.focus)
     || (from.examples || []).length !== to.examples.length
     || (from.briefing?.updated || 0) !== (to.briefing?.updated || 0);
 }
@@ -690,15 +702,18 @@ function emptyState(title, sub) {
 
 const DOTS = '<svg viewBox="0 0 10 16" aria-hidden="true"><circle cx="2.5" cy="3" r="1.4"/><circle cx="7.5" cy="3" r="1.4"/><circle cx="2.5" cy="8" r="1.4"/><circle cx="7.5" cy="8" r="1.4"/><circle cx="2.5" cy="13" r="1.4"/><circle cx="7.5" cy="13" r="1.4"/></svg>';
 
+const RING = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5" opacity=".7"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/></svg>';
+
 function todayRow(e) {
   const text = editTodayId === e.id
     ? `<input class="t-edit" data-tid="${esc(e.id)}" value="${esc(e.text)}" enterkeyhint="done" aria-label="Edit">`
-    : `<div class="t-text" data-tact="edit">${esc(e.text)}${e.rolled ? `<span class="t-rolled" title="Carried over from an earlier day">↻</span>` : ''}</div>`;
+    : `<div class="t-text" data-tact="edit">${esc(e.text)}${e.rolled ? `<span class="t-rolled" title="Carried over from an earlier day">↻</span>` : ''}${focusMinutes(e.id) ? `<span class="t-focus" title="Focused today">◷ ${fmtMinutes(focusMinutes(e.id))}</span>` : ''}</div>`;
   return `<li class="swipe-row t-wrap" data-id="${esc(e.id)}" data-list="today">
     <div class="swipe-bg" aria-hidden="true"><span class="sb-done">${e.done ? '↺ undo' : '✓ done'}</span><span class="sb-del">remove ✕</span></div>
     <div class="t-row ${e.done ? 'done' : ''} ${freshToday.has(e.id) ? 'fresh' : ''}">
       <button class="t-check" data-tact="toggle" aria-label="${e.done ? 'Mark not done' : 'Mark done'}"></button>
       ${text}
+      ${e.done ? '' : `<button class="t-timer" data-tact="focus" aria-label="Start a focus timer for this">${RING}</button>`}
       <button class="t-handle" aria-label="Drag to reorder">${DOTS}</button>
     </div>
   </li>`;
@@ -720,6 +735,7 @@ function todayPanel() {
     <div class="today-head">
       <span class="today-title">Today</span>
       <span class="today-date">${esc(date)}</span>
+      ${focusMinutes() ? `<span class="today-focus" title="Focused today">◷ ${fmtMinutes(focusMinutes())}</span>` : ''}
       ${entries.length ? `<span class="today-count${doneN === entries.length ? ' all' : ''}">${doneN}/${entries.length}</span>` : ''}
     </div>
     ${brief}
@@ -991,6 +1007,9 @@ $('#list').addEventListener('click', e => {
       if (it) addToday(it.title, it.id);
       return;
     }
+    case 'focus':
+      openFocus(id); // focus.js
+      return;
     case 'dismiss-brief':
       try { localStorage.setItem(LS.brief, todayStr()); } catch {}
       renderList();

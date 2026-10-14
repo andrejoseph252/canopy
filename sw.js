@@ -1,7 +1,7 @@
 // Offline support: network-first for the app's own files, so updates show up
 // right away when online and the last version still loads when offline.
-const CACHE = 'canopy-v6';
-const ASSETS = ['./', './index.html', './style.css', './app.js', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png'];
+const CACHE = 'canopy-v8';
+const ASSETS = ['./', './index.html', './style.css', './app.js', './focus.js', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));

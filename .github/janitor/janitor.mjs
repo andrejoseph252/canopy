@@ -71,7 +71,13 @@ function mergeMap(a = {}, b = {}) {
 const newer = (x, y) => ((y?.updated || 0) > (x?.updated || 0) ? y : x) || null;
 
 function merge(a, b) {
-  return { ...b, ...a, items: mergeMap(a.items, b.items), today: mergeMap(a.today, b.today), briefing: newer(a.briefing, b.briefing) };
+  return {
+    ...b, ...a,
+    items: mergeMap(a.items, b.items),
+    today: mergeMap(a.today, b.today),
+    focus: mergeMap(a.focus, b.focus),
+    briefing: newer(a.briefing, b.briefing),
+  };
 }
 
 /* ---------- the nightly pass ---------- */
@@ -119,7 +125,7 @@ function tidy(data, archive, t = Date.now()) {
 
 const BRIEFING_PROMPT = `You write the morning briefing at the top of someone's personal to-do app.
 Write exactly two short sentences, second person, plain text: no greeting, lists, emoji or quotation marks, under 45 words in total.
-Name the one or two things that matter most today: overdue or due-today items, and anything carried over from earlier days. If the day looks light, say so and point at something worth picking up.
+Name the one or two things that matter most today: overdue or due-today items, and anything carried over from earlier days. If the day looks light, say so and point at something worth picking up. If there were focus sessions yesterday, you may briefly acknowledge the time spent.
 Only mention things that appear in the data. Never invent tasks.`;
 
 function briefingInput(data, today, t) {
@@ -139,6 +145,9 @@ function briefingInput(data, today, t) {
       recentlyAdded: open.sort((a, b) => b.created - a.created).slice(0, 5).map(i => i.title),
     },
     finishedYesterday: items.filter(i => i.done && i.doneAt && dayIn(i.doneAt) === yesterday).length,
+    focusYesterday: Object.values(data.focus || {})
+      .filter(f => !f.deleted && f.day === yesterday)
+      .map(f => ({ subject: f.subject, minutes: f.minutes, finished: f.completed })),
   };
 }
 
