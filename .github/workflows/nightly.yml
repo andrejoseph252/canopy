@@ -1,0 +1,35 @@
+name: Nightly janitor
+
+on:
+  schedule:
+    # GitHub cron is UTC: 01:17 UTC = 03:17 in Berlin (summer) / 02:17 (winter).
+    # Off the hour on purpose; scheduled runs on the hour are often delayed.
+    - cron: '17 1 * * *'
+  workflow_dispatch: # "Run workflow" button for testing
+
+permissions:
+  contents: read
+
+concurrency:
+  group: janitor
+  cancel-in-progress: false
+
+jobs:
+  janitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: .github/janitor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+      - run: node janitor.mjs
+        env:
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TZ_NAME: Europe/Berlin

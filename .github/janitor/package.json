@@ -1,0 +1,9 @@
+{
+  "name": "canopy-janitor",
+  "private": true,
+  "type": "module",
+  "description": "Nightly tidy-up and morning briefing for Canopy",
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.128.0"
+  }
+}

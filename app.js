@@ -6,7 +6,7 @@ const FILE = 'canopy.json';
 const GEM = 'https://generativelanguage.googleapis.com/v1beta';
 const CLAUDE_MODEL = 'claude-haiku-5-5';
 const CLAUDE_SDK = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.128.0/+esm';
-const LS = { data: 'canopy:data', cfg: 'canopy:cfg', device: 'canopy:device', view: 'canopy:view', theme: 'canopy:theme' };
+const LS = { data: 'canopy:data', cfg: 'canopy:cfg', device: 'canopy:device', view: 'canopy:view', theme: 'canopy:theme', brief: 'canopy:brief' };
 const DAY_MS = 86400000;
 const STALE_DAYS = 21;
 const TOMBSTONE_DAYS = 30;
@@ -42,6 +42,7 @@ function writeJSON(key, value) {
 
 let data = readJSON(LS.data, null) || { v: 1, items: {}, examples: [] };
 data.items ||= {};
+data.today ||= {};
 data.examples ||= [];
 
 // aiKey / aiModel are the Gemini settings (named before Claude was added)
@@ -58,6 +59,8 @@ const deviceId = (() => {
 let view = (() => { try { return localStorage.getItem(LS.view) || 'all'; } catch { return 'all'; } })();
 let openId = null;
 const fresh = new Set();
+const freshToday = new Set();
+let editTodayId = null;
 let aiStatus = '';
 
 const providerKey = c => (c.provider === 'gemini' ? c.aiKey : c.claudeKey);
@@ -88,6 +91,65 @@ function update(id, patch, manual = false) {
   data.items[id] = { ...it, ...patch, ...(manual ? { sorted: 'manual', pending: null } : {}), updated: now() };
   commit();
 }
+
+/* ---------- today list: plain entries you write yourself, no AI ---------- */
+
+const liveToday = () => Object.values(data.today)
+  .filter(e => !e.deleted && e.day === todayStr())
+  .sort((a, b) => a.order - b.order || a.created - b.created);
+
+function addToday(text, ref = null) {
+  const lines = text.split(/\n+/).map(s => s.trim()).filter(Boolean);
+  if (!lines.length) return;
+  let order = Math.max(-1, ...liveToday().map(e => e.order)) + 1;
+  const t = now();
+  for (const line of lines) {
+    const e = { id: uid(), text: line, done: false, doneAt: null, order: order++, day: todayStr(), ref, created: t, updated: t };
+    data.today[e.id] = e;
+    freshToday.add(e.id);
+  }
+  commit();
+}
+
+function updateToday(id, patch) {
+  const e = data.today[id];
+  if (!e) return;
+  data.today[id] = { ...e, ...patch, updated: now() };
+  commit();
+}
+
+function toggleToday(id) {
+  const e = data.today[id];
+  if (!e) return;
+  haptic();
+  const done = !e.done;
+  const t = now();
+  data.today[id] = { ...e, done, doneAt: done ? t : null, updated: t };
+  // an entry added from the inbox completes that item too
+  const it = e.ref && data.items[e.ref];
+  if (it && !it.deleted && it.done !== done) data.items[e.ref] = { ...it, done, doneAt: done ? t : null, updated: t };
+  commit();
+}
+
+function deleteToday(id) {
+  updateToday(id, { deleted: true });
+  toast('Removed from today', () => updateToday(id, { deleted: false }));
+}
+
+// unfinished entries from earlier days carry over; finished ones stay behind (the nightly job archives them)
+function rollover() {
+  const t = todayStr();
+  let moved = false;
+  for (const e of Object.values(data.today)) {
+    if (!e.deleted && !e.done && e.day < t) {
+      data.today[e.id] = { ...e, day: t, rolled: (e.rolled || 0) + 1, updated: now() };
+      moved = true;
+    }
+  }
+  if (moved) commit();
+}
+
+const briefDismissed = () => { try { return localStorage.getItem(LS.brief); } catch { return null; } };
 
 /* ---------- rule-based sorting (instant, offline) ---------- */
 
@@ -449,29 +511,46 @@ async function pullGist() {
   return JSON.parse(content);
 }
 
-function merge(a, b) {
-  const items = { ...a.items };
-  for (const [id, it] of Object.entries(b.items || {})) {
-    const cur = items[id];
-    if (!cur || (it.updated || 0) > (cur.updated || 0)) items[id] = it;
+// per-entry merge: the most recently edited version of each entry wins
+function mergeMap(a = {}, b = {}) {
+  const out = { ...a };
+  for (const [id, it] of Object.entries(b)) {
+    const cur = out[id];
+    if (!cur || (it.updated || 0) > (cur.updated || 0)) out[id] = it;
   }
   const cutoff = now() - TOMBSTONE_DAYS * DAY_MS;
-  for (const [id, it] of Object.entries(items)) if (it.deleted && it.updated < cutoff) delete items[id];
+  for (const [id, it] of Object.entries(out)) if (it.deleted && it.updated < cutoff) delete out[id];
+  return out;
+}
 
+const newer = (x, y) => ((y?.updated || 0) > (x?.updated || 0) ? y : x) || null;
+
+function merge(a, b) {
   const seen = new Set();
   const examples = [...(a.examples || []), ...(b.examples || [])]
     .sort((x, y) => x.at - y.at)
     .filter(e => { const k = e.text + '→' + e.kind; if (seen.has(k)) return false; seen.add(k); return true; })
     .slice(-20);
-  return { v: 1, items, examples };
+  // spread first so fields from other app versions (or the nightly job) survive a sync
+  return {
+    ...b, ...a, v: 1,
+    items: mergeMap(a.items, b.items),
+    today: mergeMap(a.today, b.today),
+    examples,
+    briefing: newer(a.briefing, b.briefing),
+  };
+}
+
+function mapDiffers(from = {}, to = {}) {
+  for (const [id, it] of Object.entries(to)) if (from[id]?.updated !== it.updated) return true;
+  return Object.keys(from).length !== Object.keys(to).length;
 }
 
 function differs(from, to) {
-  for (const [id, it] of Object.entries(to.items)) {
-    if (from.items?.[id]?.updated !== it.updated) return true;
-  }
-  return Object.keys(from.items || {}).length !== Object.keys(to.items).length
-    || (from.examples || []).length !== to.examples.length;
+  return mapDiffers(from.items, to.items)
+    || mapDiffers(from.today, to.today)
+    || (from.examples || []).length !== to.examples.length
+    || (from.briefing?.updated || 0) !== (to.briefing?.updated || 0);
 }
 
 const serialize = d => JSON.stringify(d);
@@ -506,7 +585,7 @@ async function sync() {
       const needPush = !remote || wasDirty || differs(remote, merged);
       data = merged;
       writeJSON(LS.data, data);
-      if (gotNew) render();
+      if (gotNew) { rollover(); render(); }
       if (needPush) {
         await gh(`/gists/${cfg.gistId}`, { method: 'PATCH', body: JSON.stringify({ files: { [FILE]: { content: serialize(data) } } }) });
       }
@@ -593,7 +672,10 @@ function editor(it) {
     <label>notes<textarea data-field="note" placeholder="details, links, findings…">${esc(it.note)}</textarea></label>
     <div class="ed-foot">
       <span>${esc(new Date(it.created).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }).toLowerCase())} · ${esc(sortedBy)}</span>
-      <button type="button" class="danger" data-act="delete">delete</button>
+      <span class="ed-actions">
+        <button type="button" class="ed-today" data-act="to-today">☀ add to today</button>
+        <button type="button" class="danger" data-act="delete">delete</button>
+      </span>
     </div>
   </div>`;
 }
@@ -606,20 +688,68 @@ function emptyState(title, sub) {
   return `<div class="empty"><b>${esc(title)}</b>${esc(sub)}</div>`;
 }
 
+const DOTS = '<svg viewBox="0 0 10 16" aria-hidden="true"><circle cx="2.5" cy="3" r="1.4"/><circle cx="7.5" cy="3" r="1.4"/><circle cx="2.5" cy="8" r="1.4"/><circle cx="7.5" cy="8" r="1.4"/><circle cx="2.5" cy="13" r="1.4"/><circle cx="7.5" cy="13" r="1.4"/></svg>';
+
+function todayRow(e) {
+  const text = editTodayId === e.id
+    ? `<input class="t-edit" data-tid="${esc(e.id)}" value="${esc(e.text)}" enterkeyhint="done" aria-label="Edit">`
+    : `<div class="t-text" data-tact="edit">${esc(e.text)}${e.rolled ? `<span class="t-rolled" title="Carried over from an earlier day">↻</span>` : ''}</div>`;
+  return `<li class="swipe-row t-wrap" data-id="${esc(e.id)}" data-list="today">
+    <div class="swipe-bg" aria-hidden="true"><span class="sb-done">${e.done ? '↺ undo' : '✓ done'}</span><span class="sb-del">remove ✕</span></div>
+    <div class="t-row ${e.done ? 'done' : ''} ${freshToday.has(e.id) ? 'fresh' : ''}">
+      <button class="t-check" data-tact="toggle" aria-label="${e.done ? 'Mark not done' : 'Mark done'}"></button>
+      ${text}
+      <button class="t-handle" aria-label="Drag to reorder">${DOTS}</button>
+    </div>
+  </li>`;
+}
+
+function todayPanel() {
+  const t = todayStr();
+  const entries = liveToday();
+  const doneN = entries.filter(e => e.done).length;
+  const refs = new Set(entries.map(e => e.ref).filter(Boolean));
+  const suggest = live().filter(i => !i.done && i.due && i.due <= t && !refs.has(i.id)).sort(sortOpen).slice(0, 5);
+  const date = new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' }).toLowerCase();
+  const b = data.briefing;
+  const brief = b && b.date === t && b.text && briefDismissed() !== t
+    ? `<div class="brief"><span class="brief-mark">✦</span><p>${esc(b.text)}</p><button class="brief-x" data-tact="dismiss-brief" aria-label="Dismiss briefing">✕</button></div>`
+    : '';
+
+  return `<section class="today" aria-label="Today">
+    <div class="today-head">
+      <span class="today-title">Today</span>
+      <span class="today-date">${esc(date)}</span>
+      ${entries.length ? `<span class="today-count${doneN === entries.length ? ' all' : ''}">${doneN}/${entries.length}</span>` : ''}
+    </div>
+    ${brief}
+    <ul class="t-list">${entries.map(todayRow).join('')}</ul>
+    <form class="t-add" id="tAdd" autocomplete="off">
+      <span class="t-plus" aria-hidden="true">+</span>
+      <input id="tAddInput" placeholder="${entries.length ? 'add another…' : 'what do you want to do today?'}" enterkeyhint="done" aria-label="Add to today">
+    </form>
+    ${suggest.length ? `<div class="t-suggest"><span class="t-suggest-label">due</span>${suggest.map(i =>
+      `<button type="button" class="t-chip" data-tact="suggest" data-ref="${esc(i.id)}">+ ${esc(i.title)}</button>`).join('')}</div>` : ''}
+  </section>`;
+}
+
 function renderList() {
   const all = live();
   const open = all.filter(i => !i.done);
   const t = todayStr();
   let html = '';
 
+  // keep whatever is being typed in the today list across re-renders (e.g. a sync landing)
+  const active = document.activeElement;
+  const keep = active?.id === 'tAddInput' ? { sel: '#tAddInput', value: active.value }
+    : active?.classList?.contains('t-edit') ? { sel: '.t-edit', value: active.value } : null;
+
   if (view === 'done') {
     const done = all.filter(i => i.done).sort((a, b) => (b.doneAt || 0) - (a.doneAt || 0)).slice(0, 150);
     html = done.length ? section('', done, true) : emptyState('Nothing finished yet', 'checked-off things settle here');
   } else if (view === 'today') {
-    const due = open.filter(i => i.due && i.due <= t).sort(sortOpen);
     const quick = open.filter(i => !(i.due && i.due <= t) && i.size === 'quick' && i.kind !== 'idea').sort(sortOpen).slice(0, 8);
-    html = section('Due', due, true) + section('Quick wins', quick, true);
-    if (!html) html = emptyState('Nothing due today', 'clear skies');
+    html = todayPanel() + section('Quick wins', quick, true);
   } else {
     const items = view === 'all' ? open : open.filter(i => i.kind === view);
     const loose = items.filter(i => !i.group).sort(sortOpen);
@@ -630,23 +760,27 @@ function renderList() {
     }
     const ordered = [...groups.entries()]
       .sort((a, b) => Math.max(...b[1].map(i => i.updated)) - Math.max(...a[1].map(i => i.updated)));
-    html = section(ordered.length ? 'Loose ends' : '', loose) + ordered.map(([g, arr]) => section(g, arr.sort(sortOpen))).join('');
+    html = section(ordered.length || view === 'all' ? 'Inbox' : '', loose) + ordered.map(([g, arr]) => section(g, arr.sort(sortOpen))).join('');
     if (!html) html = view === 'all'
-      ? emptyState('Nothing here yet', 'throw something in above')
+      ? emptyState('Inbox is empty', 'throw something in above')
       : emptyState(`No ${KINDS[view].label.toLowerCase()} items`, 'they show up here once you add some');
+    if (view === 'all') html = todayPanel() + html;
   }
 
   $('#list').innerHTML = html;
-  if (fresh.size) setTimeout(() => fresh.clear(), 700);
+  if (keep) {
+    const el = $(keep.sel);
+    if (el) { el.value = keep.value; el.focus(); }
+  }
+  if (fresh.size || freshToday.size) setTimeout(() => { fresh.clear(); freshToday.clear(); }, 700);
 }
 
 function renderChips() {
   const all = live();
   const open = all.filter(i => !i.done);
-  const t = todayStr();
   const counts = {
     all: open.length,
-    today: open.filter(i => i.due && i.due <= t).length,
+    today: liveToday().filter(e => !e.done).length,
     done: all.filter(i => i.done).length,
   };
   for (const k of Object.keys(KINDS)) counts[k] = open.filter(i => i.kind === k).length;
@@ -828,8 +962,133 @@ $('#list').addEventListener('click', e => {
     case 'delete':
       deleteItem(id);
       return;
+    case 'to-today':
+      addToday(it.title, it.id);
+      toast('Added to today');
+      return;
   }
 });
+
+/* ---------- events: today list ---------- */
+
+$('#list').addEventListener('click', e => {
+  if (suppressClick) return;
+  const el = e.target.closest('[data-tact]');
+  if (!el) return;
+  const id = el.closest('[data-list=today]')?.dataset.id;
+
+  switch (el.dataset.tact) {
+    case 'toggle':
+      toggleToday(id);
+      return;
+    case 'edit':
+      editTodayId = id;
+      renderList();
+      { const inp = $('.t-edit'); inp?.focus(); inp?.setSelectionRange(inp.value.length, inp.value.length); }
+      return;
+    case 'suggest': {
+      const it = data.items[el.dataset.ref];
+      if (it) addToday(it.title, it.id);
+      return;
+    }
+    case 'dismiss-brief':
+      try { localStorage.setItem(LS.brief, todayStr()); } catch {}
+      renderList();
+      return;
+  }
+});
+
+$('#list').addEventListener('submit', e => {
+  if (e.target.id !== 'tAdd') return;
+  e.preventDefault();
+  const inp = $('#tAddInput');
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = '';
+  addToday(text);
+  $('#tAddInput')?.focus(); // keep the keyboard up to add the next one
+});
+
+// pasting several lines adds one entry per line
+$('#list').addEventListener('paste', e => {
+  if (e.target.id !== 'tAddInput') return;
+  const text = e.clipboardData?.getData('text') || '';
+  if (!text.includes('\n')) return;
+  e.preventDefault();
+  addToday(text);
+  $('#tAddInput')?.focus();
+});
+
+function finishTodayEdit(inp, save) {
+  const id = inp.dataset.tid;
+  if (editTodayId !== id) return; // already finished (removing a focused input can fire focusout again)
+  editTodayId = null;
+  const text = inp.value.trim();
+  const e = data.today[id];
+  if (save && e && text && text !== e.text) updateToday(id, { text });
+  else if (save && e && !text) deleteToday(id);
+  else renderList();
+}
+
+$('#list').addEventListener('keydown', e => {
+  if (!e.target.classList.contains('t-edit')) return;
+  if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+  if (e.key === 'Escape') { e.target.dataset.cancel = '1'; e.target.blur(); }
+});
+$('#list').addEventListener('focusout', e => {
+  if (e.target.classList.contains('t-edit')) finishTodayEdit(e.target, !e.target.dataset.cancel);
+});
+
+/* drag the ⋮⋮ handle to reorder (mouse or touch) */
+
+let reorder = null;
+
+$('#list').addEventListener('pointerdown', e => {
+  const handle = e.target.closest('.t-handle');
+  if (!handle) return;
+  e.preventDefault();
+  const row = handle.closest('.t-wrap');
+  reorder = { row, list: row.parentElement, id: e.pointerId, startY: e.clientY };
+  try { handle.setPointerCapture(e.pointerId); } catch {}
+  row.classList.add('lifted');
+  haptic();
+});
+
+$('#list').addEventListener('pointermove', e => {
+  if (!reorder || e.pointerId !== reorder.id) return;
+  e.preventDefault();
+  const { row, list } = reorder;
+  const center = row.offsetTop + row.offsetHeight / 2 + (e.clientY - reorder.startY);
+  const prev = row.previousElementSibling;
+  const next = row.nextElementSibling;
+  // swap with a neighbour once the dragged row passes its middle
+  if (next && center > next.offsetTop + next.offsetHeight / 2) {
+    const before = row.offsetTop;
+    list.insertBefore(next, row);
+    reorder.startY += row.offsetTop - before;
+  } else if (prev && center < prev.offsetTop + prev.offsetHeight / 2) {
+    const before = row.offsetTop;
+    list.insertBefore(row, prev);
+    reorder.startY += row.offsetTop - before;
+  }
+  row.style.transform = `translateY(${e.clientY - reorder.startY}px)`;
+});
+
+function endReorder(e) {
+  if (!reorder || e.pointerId !== reorder.id) return;
+  const { row, list } = reorder;
+  reorder = null;
+  row.style.transform = '';
+  row.classList.remove('lifted');
+  let changed = false;
+  [...list.children].forEach((li, i) => {
+    const entry = data.today[li.dataset.id];
+    if (entry && entry.order !== i) { data.today[li.dataset.id] = { ...entry, order: i, updated: now() }; changed = true; }
+  });
+  if (changed) commit();
+}
+$('#list').addEventListener('pointerup', endReorder);
+$('#list').addEventListener('pointercancel', endReorder);
 
 /* ---------- swipe gestures (touch): right = done, left = delete ---------- */
 
@@ -845,9 +1104,9 @@ const settle = (card, row) => {
 
 $('#list').addEventListener('pointerdown', e => {
   if (e.pointerType === 'mouse' || drag) return;
-  const card = e.target.closest('.item');
+  const card = e.target.closest('.item, .t-row');
   const row = card?.closest('.swipe-row');
-  if (!row || row.dataset.id === openId || e.target.closest('input, textarea, a')) return;
+  if (!row || row.dataset.id === openId || e.target.closest('input, textarea, a, .t-handle')) return;
   drag = { row, card, id: e.pointerId, x: e.clientX, y: e.clientY, dx: 0, active: false, armed: false };
 });
 
@@ -890,6 +1149,10 @@ function endDrag(e) {
   d.card.style.transition = 'transform .22s ease-in';
   d.card.style.transform = `translateX(${d.dx > 0 ? '' : '-'}110%)`;
   setTimeout(() => {
+    if (d.row.dataset.list === 'today') {
+      if (d.dx > 0) toggleToday(id); else deleteToday(id);
+      return;
+    }
     if (d.dx > 0) {
       const it = data.items[id];
       if (it && !it.done) { update(id, { done: true, doneAt: now() }); toast('Done', () => update(id, { done: false, doneAt: null })); }
@@ -938,9 +1201,11 @@ $('#sync').addEventListener('click', () => { sync(); processQueue(); });
 window.addEventListener('online', () => { sync(); processQueue(); });
 window.addEventListener('offline', () => setSync('offline'));
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') { sync(); processQueue(); render(); }
+  if (document.visibilityState === 'visible') { rollover(); sync(); processQueue(); render(); }
 });
+let lastDay = todayStr();
 setInterval(() => {
+  if (todayStr() !== lastDay) { lastDay = todayStr(); rollover(); render(); } // midnight while open
   if (document.visibilityState === 'visible') { sync(); processQueue(); }
 }, 60000);
 
@@ -1111,6 +1376,7 @@ $('#settingsForm').addEventListener('submit', e => {
 /* ---------- boot ---------- */
 
 applyTheme();
+rollover();
 render();
 sync();
 processQueue();
