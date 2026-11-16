@@ -94,7 +94,7 @@ function tidy(data, archive, t = Date.now()) {
   for (const e of Object.values(data.today)) {
     if (e.deleted) continue;
     if (!e.done && e.day < today) {
-      data.today[e.id] = { ...e, day: today, rolled: (e.rolled || 0) + 1, updated: t };
+      data.today[e.id] = { ...e, day: today, rolled: (e.rolled || 0) + 1 }; // keep `updated`: not an edit, mustn't beat a newer delete
       stats.rolledOver++;
     } else if (e.done && e.day < today) {
       archive.today[e.id] = { ...e, archivedAt: t };

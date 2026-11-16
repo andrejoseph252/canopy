@@ -140,13 +140,15 @@ function deleteToday(id) {
   toast('Removed from today', () => updateToday(id, { deleted: false }));
 }
 
-// unfinished entries from earlier days carry over; finished ones stay behind (the nightly job archives them)
+// unfinished entries from earlier days carry over; finished ones stay behind (the nightly job archives them).
+// Carrying over keeps the entry's `updated` time on purpose: it isn't an edit, and bumping it would let a
+// stale copy on another device beat a newer delete/finish during sync and bring the entry back.
 function rollover() {
   const t = todayStr();
   let moved = false;
   for (const e of Object.values(data.today)) {
     if (!e.deleted && !e.done && e.day < t) {
-      data.today[e.id] = { ...e, day: t, rolled: (e.rolled || 0) + 1, updated: now() };
+      data.today[e.id] = { ...e, day: t, rolled: (e.rolled || 0) + 1 };
       moved = true;
     }
   }
@@ -714,6 +716,7 @@ function todayRow(e) {
       <button class="t-check" data-tact="toggle" aria-label="${e.done ? 'Mark not done' : 'Mark done'}"></button>
       ${text}
       ${e.done ? '' : `<button class="t-timer" data-tact="focus" aria-label="Start a focus timer for this">${RING}</button>`}
+      <button class="t-del" data-tact="delete" aria-label="Remove from today" title="Remove from today">✕</button>
       <button class="t-handle" aria-label="Drag to reorder">${DOTS}</button>
     </div>
   </li>`;
@@ -1009,6 +1012,9 @@ $('#list').addEventListener('click', e => {
     }
     case 'focus':
       openFocus(id); // focus.js
+      return;
+    case 'delete':
+      deleteToday(id);
       return;
     case 'dismiss-brief':
       try { localStorage.setItem(LS.brief, todayStr()); } catch {}

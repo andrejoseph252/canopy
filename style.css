@@ -807,3 +807,17 @@ html.standalone[data-theme=light] .dlg-head::before {
 .t-timer svg { width: 17px; height: 17px; }
 .t-timer:active { transform: scale(.9); color: var(--accent); }
 @media (hover: hover) { .t-timer:hover { color: var(--accent); } }
+
+/* remove button: only on devices with a mouse (touch uses swipe-left), shown on row hover */
+.t-del { display: none; }
+@media (hover: hover) and (pointer: fine) {
+  .t-del {
+    width: 28px; height: 40px; flex: none;
+    display: grid; place-items: center;
+    margin-right: -8px;
+    font-size: 12px; color: var(--faint);
+    opacity: 0; transition: opacity .15s, color .15s;
+  }
+  .t-row:hover .t-del, .t-del:focus-visible { opacity: 1; }
+  .t-del:hover { color: var(--danger); }
+}
