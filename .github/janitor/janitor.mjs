@@ -76,6 +76,7 @@ function merge(a, b) {
     items: mergeMap(a.items, b.items),
     today: mergeMap(a.today, b.today),
     focus: mergeMap(a.focus, b.focus),
+    blocks: mergeMap(a.blocks, b.blocks),
     briefing: newer(a.briefing, b.briefing),
   };
 }

@@ -10,13 +10,14 @@ const STEP = 5, MIN_LEN = 5, MAX_LEN = 180;
 const GRACE_MS = 15000;
 const RINGS = 14;
 
-let session = null;   // { subject, todayId, minutes, dateKey, startedAt, lastSeen, state, stoppedAt, away }
+let session = null;   // { subject, todayId, blockId, minutes, dateKey, startedAt, lastSeen, state, stoppedAt, away }
 let focusState = 'closed';
 let tickTimer = null;
 let wakeLock = null;
 let audio = null;
 let chosenMinutes = 45;
 let pickedTodayId = null;
+let pickedBlockId = null;
 
 const fx = id => document.getElementById(id);
 
@@ -31,7 +32,7 @@ const savePrefs = p => { try { localStorage.setItem(FOCUS_PREFS, JSON.stringify(
 function logFocus(minutes, completed) {
   const t = now();
   const rec = {
-    id: uid(), subject: session.subject, todayId: session.todayId, day: session.dateKey,
+    id: uid(), subject: session.subject, todayId: session.todayId, blockId: session.blockId || null, day: session.dateKey,
     planned: session.minutes, minutes, completed, startedAt: session.startedAt, updated: t,
   };
   data.focus[rec.id] = rec;
@@ -77,15 +78,22 @@ function beginFocus() {
   const subject = inp.value.trim();
   if (!subject) { inp.focus(); inp.classList.add('invalid'); return; }
 
-  // link to a Today entry: the one you tapped, one with the same text, or a new one
+  // a block task you tapped or typed: the session counts as a block on it
+  const same = s => s.toLowerCase() === subject.toLowerCase();
+  const block = pickedBlockId && data.blocks[pickedBlockId];
+  let blockId = block && !block.deleted && block.name === subject ? pickedBlockId : null;
+  blockId ||= liveBlocks().find(b => same(b.name))?.id || null;
+  if (blockId && data.blocks[blockId].minutes !== chosenMinutes) updateBlock(blockId, { minutes: chosenMinutes });
+
+  // link to a Today entry: the one you tapped, one with the same text, or a new one (not for block tasks)
   const picked = pickedTodayId && data.today[pickedTodayId];
   let todayId = picked && !picked.deleted && picked.text === subject ? pickedTodayId : null;
-  todayId ||= liveToday().find(e => !e.done && e.text.toLowerCase() === subject.toLowerCase())?.id;
-  todayId ||= addToday(subject)[0];
+  todayId ||= liveToday().find(e => !e.done && same(e.text))?.id || null;
+  if (!todayId && !blockId) todayId = addToday(subject)[0];
 
   const t = Date.now();
   const away = fx('focusAway').checked;
-  session = { subject, todayId, minutes: chosenMinutes, dateKey: todayStr(), startedAt: t, lastSeen: t, state: 'running', away };
+  session = { subject, todayId, blockId, minutes: chosenMinutes, dateKey: todayStr(), startedAt: t, lastSeen: t, state: 'running', away };
   savePrefs({ minutes: chosenMinutes, away });
   saveSession();
   prepareAudio();
@@ -160,7 +168,7 @@ function showFocus(state) {
   }
 
   if (state === 'running') {
-    eyebrow.textContent = session.subject;
+    eyebrow.textContent = session.blockId ? `${session.subject} · ${blockOrdinal(session.blockId, 1)}` : session.subject;
     msg.textContent = session.away ? 'One ring at a time.' : 'One ring at a time. Stay with it.';
     button('end early', '', () => showFocus('confirm'));
     tick();
@@ -171,9 +179,11 @@ function showFocus(state) {
   if (state === 'confirm') {
     const min = loggable(elapsedMs());
     eyebrow.textContent = session.subject;
-    msg.textContent = min >= 1
-      ? `End now? ${min} minutes will be logged, but the rings stay unfinished.`
-      : 'End now? Less than a minute has passed, so nothing will be logged.';
+    msg.textContent = min < 1
+      ? 'End now? Less than a minute has passed, so nothing will be logged.'
+      : session.blockId
+        ? `End now? ${min} minutes will be logged, but it won’t count as a block.`
+        : `End now? ${min} minutes will be logged, but the rings stay unfinished.`;
     button('keep going', '', () => showFocus('running'));
     button(min >= 1 ? `end & log ${min}m` : 'end', 'primary', () => { session.stoppedAt = Date.now(); logPartialAndClose(); });
     tick();
@@ -183,10 +193,16 @@ function showFocus(state) {
 
   if (state === 'done') {
     const entry = data.today[session.todayId];
-    eyebrow.textContent = 'finished';
+    const blockId = session.blockId;
+    eyebrow.textContent = blockId ? 'block done' : 'finished';
     fx('focusTime').textContent = clock(durationMs());
-    msg.textContent = `${session.minutes} minutes on ${session.subject}, logged.`;
-    if (entry && !entry.deleted && !entry.done) {
+    msg.textContent = blockId
+      ? `That’s ${blockOrdinal(blockId)} on ${session.subject} today. ${session.minutes} minutes logged.`
+      : `${session.minutes} minutes on ${session.subject}, logged.`;
+    if (blockId && data.blocks[blockId] && !data.blocks[blockId].deleted) {
+      button('back to the day', '', closeFocus);
+      button('another block', 'primary', () => { closeFocus(); openFocus(null, blockId); });
+    } else if (entry && !entry.deleted && !entry.done) {
       button('back to the day', '', closeFocus);
       button('mark it done', 'primary', () => { toggleToday(session.todayId); closeFocus(); });
     } else {
@@ -216,6 +232,13 @@ function showFocus(state) {
   }
 }
 
+// "block 3", or "block 3 of 4" when the task has a daily goal
+function blockOrdinal(blockId, ahead = 0) {
+  const n = blockRecords(blockId, session.dateKey).length + ahead;
+  const goal = data.blocks[blockId]?.goal;
+  return goal ? `block ${n} of ${goal}` : `block ${n}`;
+}
+
 function tick() {
   if (!session || session.state !== 'running') return;
   if (document.visibilityState === 'visible') {
@@ -228,11 +251,18 @@ function tick() {
   drawRings(fx('rings'), progressAt());
 }
 
-// open Today entries as one-tap subjects
+// block tasks and open Today entries as one-tap subjects
 function renderPicks() {
-  const open = liveToday().filter(e => !e.done).slice(0, 6);
-  fx('focusPicks').innerHTML = open.map(e =>
-    `<button type="button" class="t-chip${e.id === pickedTodayId ? ' on' : ''}" data-pick="${esc(e.id)}">${esc(e.text)}</button>`).join('');
+  const blocks = liveBlocks().slice(0, 6);
+  const names = new Set(blocks.map(b => b.name.toLowerCase()));
+  const open = liveToday().filter(e => !e.done && !names.has(e.text.toLowerCase())).slice(0, 6);
+  fx('focusPicks').innerHTML =
+    blocks.map(b => `<button type="button" class="t-chip${b.id === pickedBlockId ? ' on' : ''}" data-pick-block="${esc(b.id)}">▮ ${esc(b.name)}</button>`).join('') +
+    open.map(e => `<button type="button" class="t-chip${e.id === pickedTodayId ? ' on' : ''}" data-pick="${esc(e.id)}">${esc(e.text)}</button>`).join('');
+}
+
+function markPreset() {
+  fx('focusPresets').querySelectorAll('[data-preset]').forEach(b => b.classList.toggle('on', +b.dataset.preset === chosenMinutes));
 }
 
 /* ---------- growth rings ---------- */
@@ -354,6 +384,7 @@ function readDial(i = Math.round(fx('dial').scrollLeft / (dialStep || 1))) {
   track.querySelector('.on')?.classList.remove('on');
   track.children[idx]?.classList.add('on');
   if (focusState === 'setup') fx('focusTime').textContent = clock(chosenMinutes * 60000);
+  markPreset();
 }
 
 function wireDial() {
@@ -421,14 +452,18 @@ function chime() {
 
 /* ---------- wiring ---------- */
 
-function openFocus(todayId = null) {
+function openFocus(todayId = null, blockId = null) {
   if (focusState !== 'closed') return;
   const prefs = loadPrefs();
-  chosenMinutes = Math.min(MAX_LEN, Math.max(MIN_LEN, Math.round((prefs.minutes || 45) / STEP) * STEP));
+  const block = blockId && data.blocks[blockId];
+  const entry = !block && todayId && data.today[todayId];
+  // a block task starts at its own usual length
+  const minutes = (block && block.minutes) || prefs.minutes || 45;
+  chosenMinutes = Math.min(MAX_LEN, Math.max(MIN_LEN, Math.round(minutes / STEP) * STEP));
   fx('focusAway').checked = !!prefs.away;
-  const entry = todayId && data.today[todayId];
+  pickedBlockId = block ? blockId : null;
   pickedTodayId = entry ? todayId : null;
-  fx('focusSubject').value = entry ? entry.text : '';
+  fx('focusSubject').value = block ? block.name : entry ? entry.text : '';
   fx('focusSubject').classList.remove('invalid');
   showFocus('setup');
 }
@@ -438,15 +473,24 @@ wireDial();
 
 fx('focusSubject').addEventListener('input', e => {
   e.target.classList.remove('invalid');
-  if (pickedTodayId && data.today[pickedTodayId]?.text !== e.target.value.trim()) { pickedTodayId = null; renderPicks(); }
+  const v = e.target.value.trim();
+  if (pickedTodayId && data.today[pickedTodayId]?.text !== v) { pickedTodayId = null; renderPicks(); }
+  if (pickedBlockId && data.blocks[pickedBlockId]?.name !== v) { pickedBlockId = null; renderPicks(); }
+});
+fx('focusPresets').addEventListener('click', e => {
+  const b = e.target.closest('[data-preset]');
+  if (b) setDial(+b.dataset.preset);
 });
 fx('focusSubject').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); beginFocus(); } });
 fx('focusPicks').addEventListener('click', e => {
-  const b = e.target.closest('[data-pick]');
+  const b = e.target.closest('[data-pick], [data-pick-block]');
   if (!b) return;
-  pickedTodayId = b.dataset.pick;
-  fx('focusSubject').value = data.today[pickedTodayId]?.text || '';
+  const block = b.dataset.pickBlock && data.blocks[b.dataset.pickBlock];
+  pickedBlockId = block ? block.id : null;
+  pickedTodayId = block ? null : b.dataset.pick;
+  fx('focusSubject').value = block ? block.name : data.today[pickedTodayId]?.text || '';
   fx('focusSubject').classList.remove('invalid');
+  if (block?.minutes) setDial(block.minutes);
   renderPicks();
 });
 fx('focusAway').addEventListener('change', () => { if (focusState === 'setup') showFocus('setup'); });

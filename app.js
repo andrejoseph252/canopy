@@ -44,6 +44,7 @@ let data = readJSON(LS.data, null) || { v: 1, items: {}, examples: [] };
 data.items ||= {};
 data.today ||= {};
 data.focus ||= {};
+data.blocks ||= {};
 data.examples ||= [];
 
 // aiKey / aiModel are the Gemini settings (named before Claude was added)
@@ -62,6 +63,8 @@ let openId = null;
 const fresh = new Set();
 const freshToday = new Set();
 let editTodayId = null;
+let editBlockId = null;
+let logBlockId = null; // the block row whose "log a block" lengths are showing
 let aiStatus = '';
 
 const providerKey = c => (c.provider === 'gemini' ? c.aiKey : c.claudeKey);
@@ -160,6 +163,84 @@ const focusMinutes = todayId => Object.values(data.focus)
   .filter(f => !f.deleted && f.day === todayStr() && (!todayId || f.todayId === todayId))
   .reduce((sum, f) => sum + (f.minutes || 0), 0);
 const fmtMinutes = m => (m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60 ? ` ${m % 60}m` : ''}`);
+
+/* ---------- blocks: ongoing things you work at in timed blocks ("study micro", 35m at a time) ---------- */
+
+// you never finish a block task, you count blocks on it. A block counts when a focus session on it
+// runs to the end, or when you log one by hand. Both are focus records with a blockId, so they sync
+// like any other focus session. Ending a session early still logs its minutes, but not a block.
+
+const BLOCK_LENGTHS = [20, 35, 45];
+const DEFAULT_BLOCK = 35;
+
+const liveBlocks = () => Object.values(data.blocks).filter(b => !b.deleted).sort((a, b) => a.created - b.created);
+
+const blockRecords = (blockId = null, fromDay = '') => Object.values(data.focus)
+  .filter(f => !f.deleted && f.completed && f.blockId && (!blockId || f.blockId === blockId) && f.day >= fromDay);
+
+// weeks start on Monday
+const weekStartStr = () => { const d = new Date(); return ymd(addDays(d, -((d.getDay() + 6) % 7))); };
+
+function addBlock(name) {
+  name = name.trim();
+  if (!name) return null;
+  const existing = liveBlocks().find(b => b.name.toLowerCase() === name.toLowerCase());
+  if (existing) return existing.id;
+  const t = now();
+  const b = { id: uid(), name, minutes: DEFAULT_BLOCK, created: t, updated: t };
+  data.blocks[b.id] = b;
+  freshToday.add(b.id);
+  commit();
+  return b.id;
+}
+
+function updateBlock(id, patch) {
+  const b = data.blocks[id];
+  if (!b) return;
+  data.blocks[id] = { ...b, ...patch, updated: now() };
+  commit();
+}
+
+function setFocusRecord(id, patch) {
+  const f = data.focus[id];
+  if (!f) return;
+  data.focus[id] = { ...f, ...patch, updated: now() };
+  commit();
+}
+
+function logBlock(id, minutes) {
+  const b = data.blocks[id];
+  if (!b) return;
+  haptic();
+  const t = now();
+  const rec = {
+    id: uid(), subject: b.name, blockId: id, todayId: null, day: todayStr(),
+    planned: minutes, minutes, completed: true, manual: true, startedAt: t - minutes * 60000, updated: t,
+  };
+  data.focus[rec.id] = rec;
+  logBlockId = null;
+  commit();
+  const n = blockRecords(id, todayStr()).length;
+  const msg = !b.goal ? `Block logged · ${n} today`
+    : n === b.goal ? `Block logged · goal of ${b.goal} reached`
+    : `Block logged · ${n}/${b.goal} today`;
+  toast(msg, () => setFocusRecord(rec.id, { deleted: true }));
+}
+
+function removeLastBlock(id) {
+  const last = blockRecords(id, todayStr()).sort((a, b) => b.startedAt - a.startedAt)[0];
+  if (!last) return;
+  logBlockId = null;
+  setFocusRecord(last.id, { deleted: true });
+  toast('Removed a block', () => setFocusRecord(last.id, { deleted: false }));
+}
+
+// the blocks already logged stay in the focus history (and in today's focus time)
+function deleteBlock(id) {
+  if (logBlockId === id) logBlockId = null;
+  updateBlock(id, { deleted: true });
+  toast('Removed from blocks', () => updateBlock(id, { deleted: false }));
+}
 
 const briefDismissed = () => { try { return localStorage.getItem(LS.brief); } catch { return null; } };
 
@@ -549,6 +630,7 @@ function merge(a, b) {
     items: mergeMap(a.items, b.items),
     today: mergeMap(a.today, b.today),
     focus: mergeMap(a.focus, b.focus),
+    blocks: mergeMap(a.blocks, b.blocks),
     examples,
     briefing: newer(a.briefing, b.briefing),
   };
@@ -563,6 +645,7 @@ function differs(from, to) {
   return mapDiffers(from.items, to.items)
     || mapDiffers(from.today, to.today)
     || mapDiffers(from.focus, to.focus)
+    || mapDiffers(from.blocks, to.blocks)
     || (from.examples || []).length !== to.examples.length
     || (from.briefing?.updated || 0) !== (to.briefing?.updated || 0);
 }
@@ -749,7 +832,98 @@ function todayPanel() {
     </form>
     ${suggest.length ? `<div class="t-suggest"><span class="t-suggest-label">due</span>${suggest.map(i =>
       `<button type="button" class="t-chip" data-tact="suggest" data-ref="${esc(i.id)}">+ ${esc(i.title)}</button>`).join('')}</div>` : ''}
+    ${blocksSection()}
   </section>`;
+}
+
+// blocks live inside the Today card but look different: no checkbox (you never finish one), a start
+// button instead, and a row of bars for today's blocks, with empty slots up to the daily goal if there is one
+
+const MAX_PIPS = 12;
+const pipWidth = m => Math.round(5 + m * 0.2); // longer blocks, longer bars
+
+function blockPips(today, b) {
+  const slots = Math.max(b.goal || 0, today.length);
+  if (!slots) return '';
+  const bars = Array.from({ length: Math.min(slots, MAX_PIPS) }, (_, i) => {
+    const r = today[i];
+    return `<i class="${r ? 'on' : ''}" style="width:${pipWidth(r ? r.minutes : b.minutes)}px"></i>`;
+  }).join('');
+  return `<span class="b-pips" aria-hidden="true">${bars}${slots > MAX_PIPS ? `<em>+${slots - MAX_PIPS}</em>` : ''}</span>`;
+}
+
+function blockDrawer(b, todayN) {
+  const lengths = [...new Set([...BLOCK_LENGTHS, b.minutes])].sort((x, y) => x - y);
+  return `<div class="b-drawer">
+    <span class="b-label">log a block</span>
+    <div class="b-opts">
+      ${lengths.map(m => `<button type="button" class="t-chip${m === b.minutes ? ' on' : ''}" data-bact="log-len" data-min="${m}">${m}m</button>`).join('')}
+    </div>
+    <span class="b-label">daily goal</span>
+    <div class="b-opts">
+      <span class="b-step">
+        <button type="button" data-bact="goal" data-d="-1" aria-label="Lower the daily goal" ${b.goal ? '' : 'disabled'}>−</button>
+        <b>${b.goal ? `${b.goal} block${b.goal === 1 ? '' : 's'}` : 'none'}</b>
+        <button type="button" data-bact="goal" data-d="1" aria-label="Raise the daily goal">+</button>
+      </span>
+      ${todayN ? '<button type="button" class="b-unlog" data-bact="unlog">− remove last</button>' : ''}
+    </div>
+  </div>`;
+}
+
+function blockRow(b) {
+  const t = todayStr();
+  const all = blockRecords(b.id);
+  const today = all.filter(r => r.day === t).sort((x, y) => x.startedAt - y.startedAt);
+  const week = all.filter(r => r.day >= weekStartStr()).length;
+  const mins = today.reduce((sum, r) => sum + r.minutes, 0);
+  const goal = b.goal || 0;
+  const met = goal && today.length >= goal;
+  const open = logBlockId === b.id;
+
+  const meta = [];
+  if (mins) meta.push(fmtMinutes(mins));
+  if (week > today.length) meta.push(`${week} this week`);
+  if (all.length > week) meta.push(`${all.length} total`);
+  if (!meta.length) meta.push(goal ? `goal ${goal} × ${b.minutes}m` : `${b.minutes}m blocks`);
+
+  const name = editBlockId === b.id
+    ? `<input class="t-edit" data-bid="${esc(b.id)}" value="${esc(b.name)}" enterkeyhint="done" aria-label="Rename">`
+    : `<div class="t-text b-name" data-bact="edit">${esc(b.name)}</div>`;
+
+  return `<li class="b-item${open ? ' open' : ''}" data-bid="${esc(b.id)}">
+    <div class="swipe-row" data-id="${esc(b.id)}" data-list="blocks">
+      <div class="swipe-bg" aria-hidden="true"><span class="sb-done">+1 block · ${b.minutes}m</span><span class="sb-del">remove ✕</span></div>
+      <div class="t-row b-row${freshToday.has(b.id) ? ' fresh' : ''}${met ? ' met' : ''}">
+        <button class="b-start" data-bact="start" aria-label="Start a ${b.minutes} minute block" title="Start a ${b.minutes}m block">${RING}</button>
+        <div class="b-main">
+          ${name}
+          <div class="b-meta">${blockPips(today, b)}<span>${esc(meta.join(' · '))}</span></div>
+        </div>
+        <span class="b-count" title="Blocks today">${today.length}${goal ? `<small>/${goal}</small>` : ''}</span>
+        <button class="b-log${open ? ' on' : ''}" data-bact="log" aria-expanded="${open}" title="Log a block, set a goal">+1</button>
+        <button class="t-del" data-bact="delete" aria-label="Remove from blocks" title="Remove from blocks">✕</button>
+      </div>
+    </div>
+    ${open ? blockDrawer(b, today.length) : ''}
+  </li>`;
+}
+
+function blocksSection() {
+  const blocks = liveBlocks();
+  const recs = blockRecords(null, todayStr());
+  const mins = recs.reduce((sum, r) => sum + r.minutes, 0);
+  return `<div class="b-sec" aria-label="Blocks">
+    <div class="b-head">
+      <span class="b-title">${RING}blocks</span>
+      ${recs.length ? `<span class="b-total">${recs.length} today · ${fmtMinutes(mins)}</span>` : ''}
+    </div>
+    ${blocks.length ? `<ul class="b-list">${blocks.map(blockRow).join('')}</ul>` : ''}
+    <form class="t-add b-add" id="bAdd" autocomplete="off">
+      <span class="t-plus" aria-hidden="true">+</span>
+      <input id="bAddInput" placeholder="${blocks.length ? 'track something else in blocks…' : 'track something in blocks, like study micro'}" enterkeyhint="done" aria-label="Add something to track in blocks">
+    </form>
+  </div>`;
 }
 
 function renderList() {
@@ -760,7 +934,7 @@ function renderList() {
 
   // keep whatever is being typed in the today list across re-renders (e.g. a sync landing)
   const active = document.activeElement;
-  const keep = active?.id === 'tAddInput' ? { sel: '#tAddInput', value: active.value }
+  const keep = active?.id === 'tAddInput' || active?.id === 'bAddInput' ? { sel: '#' + active.id, value: active.value }
     : active?.classList?.contains('t-edit') ? { sel: '.t-edit', value: active.value } : null;
 
   if (view === 'done') {
@@ -1023,6 +1197,67 @@ $('#list').addEventListener('click', e => {
   }
 });
 
+/* ---------- events: blocks ---------- */
+
+$('#list').addEventListener('click', e => {
+  if (suppressClick) return;
+  const el = e.target.closest('[data-bact]');
+  if (!el) return;
+  const id = el.closest('.b-item')?.dataset.bid;
+  if (!id || !data.blocks[id]) return;
+
+  switch (el.dataset.bact) {
+    case 'start':
+      logBlockId = null;
+      openFocus(null, id); // focus.js
+      return;
+    case 'log':
+      logBlockId = logBlockId === id ? null : id;
+      renderList();
+      return;
+    case 'log-len':
+      logBlock(id, +el.dataset.min);
+      return;
+    case 'unlog':
+      removeLastBlock(id);
+      return;
+    case 'goal': {
+      const goal = Math.max(0, Math.min(MAX_PIPS, (data.blocks[id].goal || 0) + +el.dataset.d));
+      updateBlock(id, { goal: goal || null });
+      return;
+    }
+    case 'edit':
+      editBlockId = id;
+      renderList();
+      { const inp = $('.t-edit'); inp?.focus(); inp?.setSelectionRange(inp.value.length, inp.value.length); }
+      return;
+    case 'delete':
+      deleteBlock(id);
+      return;
+  }
+});
+
+$('#list').addEventListener('submit', e => {
+  if (e.target.id !== 'bAdd') return;
+  e.preventDefault();
+  const inp = $('#bAddInput');
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = '';
+  addBlock(text);
+  $('#bAddInput')?.focus();
+});
+
+function finishBlockEdit(inp, save) {
+  const id = inp.dataset.bid;
+  if (editBlockId !== id) return;
+  editBlockId = null;
+  const name = inp.value.trim();
+  const b = data.blocks[id];
+  if (save && b && name && name !== b.name) updateBlock(id, { name });
+  else renderList();
+}
+
 $('#list').addEventListener('submit', e => {
   if (e.target.id !== 'tAdd') return;
   e.preventDefault();
@@ -1061,7 +1296,9 @@ $('#list').addEventListener('keydown', e => {
   if (e.key === 'Escape') { e.target.dataset.cancel = '1'; e.target.blur(); }
 });
 $('#list').addEventListener('focusout', e => {
-  if (e.target.classList.contains('t-edit')) finishTodayEdit(e.target, !e.target.dataset.cancel);
+  if (!e.target.classList.contains('t-edit')) return;
+  if (e.target.dataset.bid) finishBlockEdit(e.target, !e.target.dataset.cancel);
+  else finishTodayEdit(e.target, !e.target.dataset.cancel);
 });
 
 /* drag the ⋮⋮ handle to reorder (mouse or touch) */
@@ -1174,6 +1411,10 @@ function endDrag(e) {
   d.card.style.transition = 'transform .22s ease-in';
   d.card.style.transform = `translateX(${d.dx > 0 ? '' : '-'}110%)`;
   setTimeout(() => {
+    if (d.row.dataset.list === 'blocks') {
+      if (d.dx > 0) logBlock(id, data.blocks[id]?.minutes || DEFAULT_BLOCK); else deleteBlock(id);
+      return;
+    }
     if (d.row.dataset.list === 'today') {
       if (d.dx > 0) toggleToday(id); else deleteToday(id);
       return;
@@ -1208,6 +1449,7 @@ $('#list').addEventListener('change', e => {
 
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && openId && !$('#settings').open) { openId = null; renderList(); }
+  if (e.key === 'Escape' && logBlockId && !$('#settings').open) { logBlockId = null; renderList(); }
   if (e.key === '/' && document.activeElement === document.body) { e.preventDefault(); input.focus(); }
 });
 
