@@ -64,7 +64,7 @@ const fresh = new Set();
 const freshToday = new Set();
 let editTodayId = null;
 let editBlockId = null;
-let logBlockId = null; // the block row whose "log a block" lengths are showing
+let openBlockId = null; // the block row whose drawer (week, lengths, goal) is open
 let aiStatus = '';
 
 const providerKey = c => (c.provider === 'gemini' ? c.aiKey : c.claudeKey);
@@ -102,19 +102,30 @@ const liveToday = () => Object.values(data.today)
   .filter(e => !e.deleted && e.day === todayStr())
   .sort((a, b) => a.order - b.order || a.created - b.created);
 
+// "study micro ×4", "study micro x4" or "study micro 4 blocks" is a block task with a daily goal of 4
+function parseBlockLine(line) {
+  const m = line.match(/^(.+?)\s+(?:[x×]\s*(\d{1,2})|(\d{1,2})\s*blocks?)$/i);
+  const goal = m && +(m[2] || m[3]);
+  return m && goal >= 1 && goal <= MAX_PIPS ? { name: m[1].trim(), goal } : null;
+}
+
 function addToday(text, ref = null) {
   const lines = text.split(/\n+/).map(s => s.trim()).filter(Boolean);
   if (!lines.length) return [];
   let order = Math.max(-1, ...liveToday().map(e => e.order)) + 1;
   const t = now();
   const ids = [];
+  const blocks = [];
   for (const line of lines) {
+    const asBlock = !ref && parseBlockLine(line);
+    if (asBlock) { addBlock(asBlock.name, asBlock.goal); blocks.push(asBlock); continue; }
     const e = { id: uid(), text: line, done: false, doneAt: null, order: order++, day: todayStr(), ref, created: t, updated: t };
     data.today[e.id] = e;
     freshToday.add(e.id);
     ids.push(e.id);
   }
   commit();
+  if (blocks.length) toast(blocks.length === 1 ? `${blocks[0].name} · ${blocks[0].goal} blocks today` : `${blocks.length} block tasks added`);
   return ids;
 }
 
@@ -181,17 +192,38 @@ const blockRecords = (blockId = null, fromDay = '') => Object.values(data.focus)
 // weeks start on Monday
 const weekStartStr = () => { const d = new Date(); return ymd(addDays(d, -((d.getDay() + 6) % 7))); };
 
-function addBlock(name) {
+// adding a name you've used before brings that task (and its history) back
+function addBlock(name, goal = null) {
   name = name.trim();
   if (!name) return null;
-  const existing = liveBlocks().find(b => b.name.toLowerCase() === name.toLowerCase());
-  if (existing) return existing.id;
+  const same = b => b.name.toLowerCase() === name.toLowerCase();
+  const existing = liveBlocks().find(same)
+    || Object.values(data.blocks).filter(b => b.deleted && same(b)).sort((a, b) => b.updated - a.updated)[0];
+  if (existing) {
+    updateBlock(existing.id, { deleted: false, ...(goal ? { goal } : {}) });
+    return existing.id;
+  }
   const t = now();
-  const b = { id: uid(), name, minutes: DEFAULT_BLOCK, created: t, updated: t };
+  const b = { id: uid(), name, minutes: DEFAULT_BLOCK, goal, created: t, updated: t };
   data.blocks[b.id] = b;
   freshToday.add(b.id);
   commit();
   return b.id;
+}
+
+// a Today entry that turns out to be block work moves into the blocks box
+function todayToBlock(id) {
+  const e = data.today[id];
+  if (!e) return;
+  const parsed = parseBlockLine(e.text) || { name: e.text, goal: null };
+  editTodayId = null;
+  const wasNew = !liveBlocks().some(b => b.name.toLowerCase() === parsed.name.toLowerCase());
+  const bid = addBlock(parsed.name, parsed.goal);
+  updateToday(id, { deleted: true });
+  toast(`Moved ${parsed.name} to blocks`, () => {
+    updateToday(id, { deleted: false });
+    if (wasNew) updateBlock(bid, { deleted: true });
+  });
 }
 
 function updateBlock(id, patch) {
@@ -218,26 +250,26 @@ function logBlock(id, minutes) {
     planned: minutes, minutes, completed: true, manual: true, startedAt: t - minutes * 60000, updated: t,
   };
   data.focus[rec.id] = rec;
-  logBlockId = null;
   commit();
   const n = blockRecords(id, todayStr()).length;
   const msg = !b.goal ? `Block logged · ${n} today`
-    : n === b.goal ? `Block logged · goal of ${b.goal} reached`
-    : `Block logged · ${n}/${b.goal} today`;
+    : n === b.goal ? `Goal reached · ${n} blocks ✓`
+    : n > b.goal ? `Block logged · ${n} today, goal met`
+    : `Block logged · ${n} of ${b.goal}`;
   toast(msg, () => setFocusRecord(rec.id, { deleted: true }));
 }
 
-function removeLastBlock(id) {
-  const last = blockRecords(id, todayStr()).sort((a, b) => b.startedAt - a.startedAt)[0];
-  if (!last) return;
-  logBlockId = null;
-  setFocusRecord(last.id, { deleted: true });
-  toast('Removed a block', () => setFocusRecord(last.id, { deleted: false }));
+function unlogBlock(recId) {
+  const rec = data.focus[recId];
+  if (!rec) return;
+  haptic();
+  setFocusRecord(recId, { deleted: true });
+  toast('Block undone', () => setFocusRecord(recId, { deleted: false }));
 }
 
 // the blocks already logged stay in the focus history (and in today's focus time)
 function deleteBlock(id) {
-  if (logBlockId === id) logBlockId = null;
+  if (openBlockId === id) openBlockId = null;
   updateBlock(id, { deleted: true });
   toast('Removed from blocks', () => updateBlock(id, { deleted: false }));
 }
@@ -276,13 +308,17 @@ function parseDue(text) {
   return null;
 }
 
+// a date phrase at the end of a capture ("…by friday", "…tomorrow") becomes the due date, not part of the title
+const DUE_TAIL = /[\s,]+(?:(?:by|on|due|this|next|before)\s+)?(?:today|tonight|tomorrow|tmrw|tmr|next week|(?:this )?weekend|in \d{1,2} days?|(?:sun|mon|tue|wed|thu|fri|sat)[a-z]*)$/i;
+
 function ruleSort(line) {
   const tags = [...line.matchAll(/(^|\s)#([\w-]+)/g)].map(m => m[2].toLowerCase());
   let title = line.replace(/(^|\s)#[\w-]+/g, ' ').replace(/\s+/g, ' ').trim();
   const url = (title.match(RX.url) || [])[0] || '';
 
   let kind = 'do';
-  if (RX.idea.test(title)) kind = 'idea';
+  if (/^book\s+(a|an|the|my|flights?|tickets?|hotels?|tables?|rooms?|appointments?|trains?|cars?)\b/i.test(title)) kind = 'do';
+  else if (RX.idea.test(title)) kind = 'idea';
   else if (RX.look.test(title)) kind = 'look';
   else if (RX.get.test(title)) kind = 'get';
   else if (RX.read.test(title) || url) kind = 'read';
@@ -292,7 +328,9 @@ function ruleSort(line) {
     title = title.replace(url, '').trim();
     if (!title) { try { const u = new URL(url); title = u.hostname.replace(/^www\./, '') + u.pathname.replace(/\/$/, ''); } catch { title = url; } }
   }
-  return { title, kind, tags, due: parseDue(line), note: url };
+  const due = parseDue(line);
+  if (due) title = title.replace(DUE_TAIL, '').trim() || title;
+  return { title, kind, tags, due, note: url };
 }
 
 function capture(text) {
@@ -741,7 +779,7 @@ function card(it, showGroup) {
   if (fresh.has(it.id)) cls.push('fresh');
   if (openId === it.id) cls.push('open');
 
-  return `<li class="swipe-row" data-id="${esc(it.id)}" style="--kc:var(--k-${esc(it.kind)})">
+  return `<li class="swipe-row${openId === it.id ? ' open-row' : ''}" data-id="${esc(it.id)}" style="--kc:var(--k-${esc(it.kind)})">
     <div class="swipe-bg" aria-hidden="true"><span class="sb-done">${it.done ? '↺ not done' : '✓ done'}</span><span class="sb-del">delete ✕</span></div>
     <div class="${cls.join(' ')}">
       <button class="check" data-act="toggle" aria-label="${it.done ? 'Mark not done' : 'Mark done'}"></button>
@@ -791,16 +829,16 @@ const RING = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-
 
 function todayRow(e) {
   const text = editTodayId === e.id
-    ? `<input class="t-edit" data-tid="${esc(e.id)}" value="${esc(e.text)}" enterkeyhint="done" aria-label="Edit">`
+    ? `<input class="t-edit" data-tid="${esc(e.id)}" value="${esc(e.text)}" enterkeyhint="done" aria-label="Edit"><button type="button" class="t-to-blocks" data-tact="to-blocks" title="Track this in blocks instead">◎ blocks</button>`
     : `<div class="t-text" data-tact="edit">${esc(e.text)}${e.rolled ? `<span class="t-rolled" title="Carried over from an earlier day">↻</span>` : ''}${focusMinutes(e.id) ? `<span class="t-focus" title="Focused today">◷ ${fmtMinutes(focusMinutes(e.id))}</span>` : ''}</div>`;
   return `<li class="swipe-row t-wrap" data-id="${esc(e.id)}" data-list="today">
     <div class="swipe-bg" aria-hidden="true"><span class="sb-done">${e.done ? '↺ undo' : '✓ done'}</span><span class="sb-del">remove ✕</span></div>
     <div class="t-row ${e.done ? 'done' : ''} ${freshToday.has(e.id) ? 'fresh' : ''}">
       <button class="t-check" data-tact="toggle" aria-label="${e.done ? 'Mark not done' : 'Mark done'}"></button>
       ${text}
-      ${e.done ? '' : `<button class="t-timer" data-tact="focus" aria-label="Start a focus timer for this">${RING}</button>`}
+      ${e.done || editTodayId === e.id ? '' : `<button class="t-timer" data-tact="focus" aria-label="Start a focus timer for this">${RING}</button>`}
       <button class="t-del" data-tact="delete" aria-label="Remove from today" title="Remove from today">✕</button>
-      <button class="t-handle" aria-label="Drag to reorder">${DOTS}</button>
+      <button class="t-handle" aria-label="Drag to reorder, or up into Blocks" title="Drag to reorder, or up into Blocks">${DOTS}</button>
     </div>
   </li>`;
 }
@@ -825,103 +863,241 @@ function todayPanel() {
       ${entries.length ? `<span class="today-count${doneN === entries.length ? ' all' : ''}">${doneN}/${entries.length}</span>` : ''}
     </div>
     ${brief}
+    ${blocksSection()}
     <ul class="t-list">${entries.map(todayRow).join('')}</ul>
     <form class="t-add" id="tAdd" autocomplete="off">
       <span class="t-plus" aria-hidden="true">+</span>
-      <input id="tAddInput" placeholder="${entries.length ? 'add another…' : 'what do you want to do today?'}" enterkeyhint="done" aria-label="Add to today">
+      <input id="tAddInput" placeholder="${entries.length ? 'add another…' : liveBlocks().length ? 'what else is on today?' : 'what’s on today? “study micro ×4” makes blocks'}" enterkeyhint="done" aria-label="Add to today">
     </form>
     ${suggest.length ? `<div class="t-suggest"><span class="t-suggest-label">due</span>${suggest.map(i =>
       `<button type="button" class="t-chip" data-tact="suggest" data-ref="${esc(i.id)}">+ ${esc(i.title)}</button>`).join('')}</div>` : ''}
-    ${blocksSection()}
   </section>`;
 }
 
 // blocks live inside the Today card but look different: no checkbox (you never finish one), a start
-// button instead, and a row of bars for today's blocks, with empty slots up to the daily goal if there is one
+// button instead, and a strip of slots, one per block. Filled slots are blocks done today, empty ones are
+// the plan. Tap an empty slot to complete a block, a filled one to undo it; tap + or drag across the strip
+// to plan more or fewer. Tapping the name opens a drawer with the week, the block length and the rest.
 
-const MAX_PIPS = 12;
-const pipWidth = m => Math.round(5 + m * 0.2); // longer blocks, longer bars
+const MAX_PIPS = 10; // ten blocks of one thing is a long day; it also keeps the strip on one line on a phone
 
-function blockPips(today, b) {
-  const slots = Math.max(b.goal || 0, today.length);
-  if (!slots) return '';
-  const bars = Array.from({ length: Math.min(slots, MAX_PIPS) }, (_, i) => {
+// slots shrink as you plan more, so the strip always fits on one line
+const slotSize = n => (n + 1 <= 6 ? 'l' : n + 1 <= 8 ? 'm' : 's');
+
+// the slots for a task: done ones (with their record), then planned ones, then the + to add more
+function slotsHTML(b, today, planned) {
+  const n = Math.max(planned, today.length);
+  const slots = Array.from({ length: n }, (_, i) => {
     const r = today[i];
-    return `<i class="${r ? 'on' : ''}" style="width:${pipWidth(r ? r.minutes : b.minutes)}px"></i>`;
+    return r
+      ? `<button type="button" class="b-slot done" data-bact="slot-undo" data-rid="${esc(r.id)}" aria-label="Block ${i + 1} done at ${clockText(r.startedAt)}. Tap to undo" title="${r.minutes}m · ${clockText(r.startedAt)}"></button>`
+      : `<button type="button" class="b-slot todo" data-bact="slot-fill" aria-label="Complete block ${i + 1}" title="Tap when this block is done"></button>`;
   }).join('');
-  return `<span class="b-pips" aria-hidden="true">${bars}${slots > MAX_PIPS ? `<em>+${slots - MAX_PIPS}</em>` : ''}</span>`;
+  const add = n < MAX_PIPS ? `<button type="button" class="b-slot add" data-bact="slot-add" aria-label="Plan another block" title="Tap or drag to plan blocks">+</button>` : '';
+  return `${slots}${add}`;
 }
 
-function blockDrawer(b, todayN) {
+// Monday to Sunday, one column per day
+function blockWeek(b, all) {
+  const start = parseYmd(weekStartStr());
+  const t = todayStr();
+  const days = Array.from({ length: 7 }, (_, i) => {
+    const day = ymd(addDays(start, i));
+    return { day, n: all.filter(r => r.day === day).length, label: 'MTWTFSS'[i] };
+  });
+  const top = Math.max(b.goal || 0, ...days.map(d => d.n), 1);
+  const pct = n => Math.round((n / top) * 82); // leave headroom so the goal line stays visible
+  const total = days.reduce((sum, d) => sum + d.n, 0);
+  const cols = days.map(d => `<div class="bw-day${d.day === t ? ' now' : ''}${d.day > t ? ' future' : ''}" title="${esc(d.day)}: ${d.n} block${d.n === 1 ? '' : 's'}">
+      <span class="bw-n">${d.n || ''}</span>
+      <span class="bw-bar"><i style="height:${pct(d.n)}%"></i>${b.goal ? `<s style="bottom:${pct(b.goal)}%"></s>` : ''}</span>
+      <span class="bw-d">${d.label}</span>
+    </div>`).join('');
+  return `<div class="bw" aria-label="This week: ${total} blocks">${cols}</div>`;
+}
+
+function blockDrawer(b, all) {
   const lengths = [...new Set([...BLOCK_LENGTHS, b.minutes])].sort((x, y) => x - y);
+  const week = all.filter(r => r.day >= weekStartStr()).length;
   return `<div class="b-drawer">
-    <span class="b-label">log a block</span>
-    <div class="b-opts">
-      ${lengths.map(m => `<button type="button" class="t-chip${m === b.minutes ? ' on' : ''}" data-bact="log-len" data-min="${m}">${m}m</button>`).join('')}
+    <div class="b-week">
+      <div class="b-week-head"><span class="b-label">this week</span><span class="b-week-n">${week} block${week === 1 ? '' : 's'}${all.length > week ? ` · ${all.length} all time` : ''}</span></div>
+      ${blockWeek(b, all)}
     </div>
-    <span class="b-label">daily goal</span>
-    <div class="b-opts">
-      <span class="b-step">
-        <button type="button" data-bact="goal" data-d="-1" aria-label="Lower the daily goal" ${b.goal ? '' : 'disabled'}>−</button>
-        <b>${b.goal ? `${b.goal} block${b.goal === 1 ? '' : 's'}` : 'none'}</b>
-        <button type="button" data-bact="goal" data-d="1" aria-label="Raise the daily goal">+</button>
-      </span>
-      ${todayN ? '<button type="button" class="b-unlog" data-bact="unlog">− remove last</button>' : ''}
+    <div class="b-fields">
+      <span class="b-label">block length</span>
+      <div class="b-opts">
+        ${lengths.map(m => `<button type="button" class="t-chip${m === b.minutes ? ' on' : ''}" data-bact="length" data-min="${m}" aria-pressed="${m === b.minutes}">${m}m</button>`).join('')}
+      </div>
+    </div>
+    <div class="b-foot">
+      <button type="button" data-bact="edit">rename</button>
+      <button type="button" class="b-remove" data-bact="delete">remove</button>
     </div>
   </div>`;
 }
 
-function blockRow(b) {
+function blockRow(b, i = 0) {
   const t = todayStr();
   const all = blockRecords(b.id);
   const today = all.filter(r => r.day === t).sort((x, y) => x.startedAt - y.startedAt);
-  const week = all.filter(r => r.day >= weekStartStr()).length;
   const mins = today.reduce((sum, r) => sum + r.minutes, 0);
   const goal = b.goal || 0;
   const met = goal && today.length >= goal;
-  const open = logBlockId === b.id;
+  const open = openBlockId === b.id;
 
-  const meta = [];
-  if (mins) meta.push(fmtMinutes(mins));
-  if (week > today.length) meta.push(`${week} this week`);
-  if (all.length > week) meta.push(`${all.length} total`);
-  if (!meta.length) meta.push(goal ? `goal ${goal} × ${b.minutes}m` : `${b.minutes}m blocks`);
-
+  // a word of help until the strip has been used once
+  const hint = !goal && !today.length ? 'tap + or drag to plan blocks'
+    : !blockRecords().length && goal ? 'tap a block when it’s done' : '';
+  const meta = mins ? fmtMinutes(mins) : hint;
   const name = editBlockId === b.id
     ? `<input class="t-edit" data-bid="${esc(b.id)}" value="${esc(b.name)}" enterkeyhint="done" aria-label="Rename">`
-    : `<div class="t-text b-name" data-bact="edit">${esc(b.name)}</div>`;
+    : `<button type="button" class="t-text b-name" data-bact="open" aria-expanded="${open}" title="Week, length, rename">${esc(b.name)}</button>`;
 
-  return `<li class="b-item${open ? ' open' : ''}" data-bid="${esc(b.id)}">
+  return `<li class="b-item${open ? ' open' : ''}" data-bid="${esc(b.id)}" style="--bc:var(--lane-${i % LANES})">
     <div class="swipe-row" data-id="${esc(b.id)}" data-list="blocks">
       <div class="swipe-bg" aria-hidden="true"><span class="sb-done">+1 block · ${b.minutes}m</span><span class="sb-del">remove ✕</span></div>
       <div class="t-row b-row${freshToday.has(b.id) ? ' fresh' : ''}${met ? ' met' : ''}">
-        <button class="b-start" data-bact="start" aria-label="Start a ${b.minutes} minute block" title="Start a ${b.minutes}m block">${RING}</button>
+        <button class="b-start" data-bact="start" aria-label="Start a ${b.minutes} minute block of ${esc(b.name)}" title="Start a ${b.minutes}m block">${RING}</button>
         <div class="b-main">
           ${name}
-          <div class="b-meta">${blockPips(today, b)}<span>${esc(meta.join(' · '))}</span></div>
+          <div class="b-track">
+            <div class="b-slots" data-size="${slotSize(Math.max(goal, today.length))}" data-goal="${goal}" data-done="${today.length}" role="group" aria-label="${today.length} of ${Math.max(goal, today.length)} blocks done">${slotsHTML(b, today, goal)}</div>
+            ${meta ? `<span class="b-meta-t${mins ? '' : ' hint'}">${esc(meta)}</span>` : ''}
+          </div>
         </div>
-        <span class="b-count" title="Blocks today">${today.length}${goal ? `<small>/${goal}</small>` : ''}</span>
-        <button class="b-log${open ? ' on' : ''}" data-bact="log" aria-expanded="${open}" title="Log a block, set a goal">+1</button>
-        <button class="t-del" data-bact="delete" aria-label="Remove from blocks" title="Remove from blocks">✕</button>
+        ${goal || today.length ? `<span class="b-count" aria-hidden="true">${today.length}${goal ? `<small>/${goal}</small>` : ''}</span>` : ''}
       </div>
     </div>
-    ${open ? blockDrawer(b, today.length) : ''}
+    ${open ? blockDrawer(b, all) : ''}
   </li>`;
 }
 
+/* ---------- the day ring: a 24-hour dial with a lane per block task ---------- */
+
+// midnight at the top, clockwise. Every block (and other focus session) is an arc at the time it happened,
+// on its task's lane, so a long stretch of deep work reads as one sweep. The dot is now.
+
+const LANES = 5;
+const seenArcs = new Set(); // arcs already drawn once; new ones grow in
+const clockAngle = ms => { const d = new Date(ms); return ((d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60) / 1440) * 360; };
+const clockText = ms => new Date(ms).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }).toLowerCase().replace(/\s/g, '');
+
+function polar(r, deg) {
+  const t = (deg - 90) * Math.PI / 180;
+  return [100 + r * Math.cos(t), 100 + r * Math.sin(t)];
+}
+
+function arcPath(r, a0, a1) {
+  const [x0, y0] = polar(r, a0), [x1, y1] = polar(r, Math.max(a1, a0 + 0.01));
+  return `M${x0.toFixed(2)} ${y0.toFixed(2)}A${r} ${r} 0 ${a1 - a0 > 180 ? 1 : 0} 1 ${x1.toFixed(2)} ${y1.toFixed(2)}`;
+}
+
+function dayRing(blocks) {
+  const t = todayStr();
+  const sessions = Object.values(data.focus).filter(f => !f.deleted && f.day === t && f.minutes);
+  const lane = new Map(blocks.map((b, i) => [b.id, i]));
+  const others = sessions.filter(f => !(f.completed && lane.has(f.blockId)));
+  const lanes = Math.min(blocks.length, LANES) + (others.length ? 1 : 0);
+  const outer = 82, inner = 54;
+  const step = Math.min(10, (outer - inner) / Math.max(1, lanes - 1));
+  const radius = i => outer - i * step;
+  const width = Math.max(3, Math.min(7.5, step * 0.72));
+
+  const ticks = Array.from({ length: 24 }, (_, h) => {
+    const major = h % 6 === 0;
+    const [x0, y0] = polar(major ? 89 : 91, h * 15), [x1, y1] = polar(95, h * 15);
+    return `<line class="dr-tick${major ? ' major' : ''}" x1="${x0.toFixed(1)}" y1="${y0.toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}"/>`;
+  }).join('');
+
+  const tracks = Array.from({ length: lanes }, (_, i) =>
+    `<circle class="dr-track" cx="100" cy="100" r="${radius(i)}" style="stroke-width:${(width * 0.6).toFixed(2)}${i < blocks.length ? `;--bc:var(--lane-${i % LANES})` : ''}"/>`).join('');
+
+  const arcs = sessions.map(f => {
+    const isBlock = f.completed && lane.has(f.blockId);
+    const li = isBlock ? Math.min(lane.get(f.blockId), LANES - 1) : lanes - 1;
+    const end = f.startedAt + f.minutes * 60000;
+    const a0 = clockAngle(f.startedAt);
+    const a1 = a0 + (f.minutes / 1440) * 360;
+    const isNew = !seenArcs.has(f.id);
+    // while the focus screen covers the list, save the grow-in for when it closes
+    if (typeof focusState === 'undefined' || focusState === 'closed') seenArcs.add(f.id);
+    return `<path class="dr-arc${isBlock ? '' : ' other'}${isNew ? ' grow' : ''}" pathLength="1" d="${arcPath(radius(li), a0, a1)}"
+      style="stroke-width:${isBlock ? width : Math.max(2, width * 0.55)}${isBlock ? `;--bc:var(--lane-${lane.get(f.blockId) % LANES})` : ''}">
+      <title>${esc(f.subject || 'focus')} · ${clockText(f.startedAt)}–${clockText(end)}${isBlock ? '' : f.completed ? '' : ' (ended early)'}</title></path>`;
+  }).join('');
+
+  const nowA = clockAngle(now());
+  const [nx, ny] = polar(92, nowA);
+  const elapsed = `<path class="dr-elapsed" d="${arcPath(92, 0, nowA)}"/>`;
+  const done = blockRecords(null, t).length;
+  const goals = blocks.reduce((sum, b) => sum + (b.goal || 0), 0);
+
+  return `<div class="dr" role="img" aria-label="${done} blocks today${goals ? ` of ${goals}` : ''}">
+    <svg viewBox="0 0 200 200" aria-hidden="true">
+      ${ticks}${elapsed}${tracks}${arcs}
+      <circle class="dr-now-halo" cx="${nx.toFixed(2)}" cy="${ny.toFixed(2)}" r="5"/>
+      <circle class="dr-now" cx="${nx.toFixed(2)}" cy="${ny.toFixed(2)}" r="2.6"/>
+    </svg>
+    <div class="dr-center"><span class="dr-big">${done}${goals ? `<small>/${goals}</small>` : ''}</span><span class="dr-unit">blocks</span></div>
+  </div>`;
+}
+
+// the next thing to put a block into: the first task still short of its goal, else the one you used last
+function nextBlock(blocks) {
+  const t = todayStr();
+  const count = b => blockRecords(b.id, t).length;
+  const short = blocks.find(b => b.goal && count(b) < b.goal);
+  if (short) return short;
+  if (blocks.some(b => b.goal)) return null; // every goal met
+  const last = blockRecords(null, t).sort((a, b) => b.startedAt - a.startedAt)[0];
+  return (last && blocks.find(b => b.id === last.blockId)) || blocks[0] || null;
+}
+
+function dayHero(blocks) {
+  const t = todayStr();
+  const recs = blockRecords(null, t).sort((a, b) => a.startedAt - b.startedAt);
+  const goals = blocks.reduce((sum, b) => sum + (b.goal || 0), 0);
+  const toGo = blocks.reduce((sum, b) => sum + Math.max(0, (b.goal || 0) - blockRecords(b.id, t).length), 0);
+  const mins = recs.reduce((sum, r) => sum + r.minutes, 0);
+  const next = nextBlock(blocks);
+  const nextIdx = next ? blocks.indexOf(next) : 0;
+
+  const headline = goals && !toGo ? 'All goals met'
+    : goals ? `${toGo} block${toGo === 1 ? '' : 's'} to go`
+    : recs.length ? `${recs.length} block${recs.length === 1 ? '' : 's'} in`
+    : 'Ready when you are';
+  const meta = recs.length
+    ? `${fmtMinutes(mins)} in blocks · since ${clockText(recs[0].startedAt)}`
+    : goals ? `${goals} planned today` : 'tap + to plan your blocks';
+  const cta = next
+    ? `<button type="button" class="dr-next" data-bact="start" data-next="${esc(next.id)}" title="Start a ${next.minutes}m block of ${esc(next.name)}" style="--bc:var(--lane-${nextIdx % LANES})">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.5v9l7.5-4.5z" fill="currentColor"/></svg>
+        <span class="dr-next-name">${esc(next.name)}</span>
+        <span class="dr-next-n">${next.minutes}m</span>
+      </button>`
+    : `<span class="dr-done">✓ nice work</span>`;
+
+  return `<div class="dr-hero${goals && !toGo ? ' met' : ''}">
+    ${dayRing(blocks)}
+    <div class="dr-info">
+      <span class="b-title">${RING}blocks</span>
+      <span class="dr-headline">${esc(headline)}</span>
+      <span class="dr-meta">${esc(meta)}</span>
+      ${cta}
+    </div>
+  </div>`;
+}
+
+// the box at the top of Today: the work your day is built around
 function blocksSection() {
   const blocks = liveBlocks();
-  const recs = blockRecords(null, todayStr());
-  const mins = recs.reduce((sum, r) => sum + r.minutes, 0);
-  return `<div class="b-sec" aria-label="Blocks">
-    <div class="b-head">
-      <span class="b-title">${RING}blocks</span>
-      ${recs.length ? `<span class="b-total">${recs.length} today · ${fmtMinutes(mins)}</span>` : ''}
-    </div>
+  return `<div class="b-sec${blocks.length ? '' : ' empty'}" aria-label="Blocks">
+    ${blocks.length ? dayHero(blocks) : `<div class="b-head"><span class="b-title">${RING}blocks</span></div>`}
     ${blocks.length ? `<ul class="b-list">${blocks.map(blockRow).join('')}</ul>` : ''}
     <form class="t-add b-add" id="bAdd" autocomplete="off">
       <span class="t-plus" aria-hidden="true">+</span>
-      <input id="bAddInput" placeholder="${blocks.length ? 'track something else in blocks…' : 'track something in blocks, like study micro'}" enterkeyhint="done" aria-label="Add something to track in blocks">
+      <input id="bAddInput" placeholder="add, or drag a task up here" enterkeyhint="done" aria-label="Add something to track in blocks">
     </form>
   </div>`;
 }
@@ -978,7 +1154,8 @@ function renderChips() {
   };
   for (const k of Object.keys(KINDS)) counts[k] = open.filter(i => i.kind === k).length;
 
-  const defs = [['all', 'All'], ['today', 'Today'], ...Object.entries(KINDS).map(([k, v]) => [k, v.short, v.glyph]), ['done', 'Done']];
+  const defs = [['all', 'All'], ['today', 'Today'], ...Object.entries(KINDS).map(([k, v]) => [k, v.short, v.glyph]), ['done', 'Done']]
+    .filter(([key]) => !KINDS[key] || counts[key] || view === key);
   $('#chips').innerHTML = defs.map(([key, label, glyph]) =>
     `<button class="chip ${view === key ? 'on' : ''} ${counts[key] ? '' : 'zero'}" data-view="${key}" ${glyph ? `style="--kc:var(--k-${key})"` : ''}>
       ${glyph ? `<span class="g">${glyph}</span>` : ''}${esc(label)}<span class="n">${counts[key]}</span>
@@ -996,12 +1173,12 @@ function renderHint() {
     $('#hint').innerHTML = aiStatus ? `<span class="${aiStatus.warn ? 'warn' : ''}">${esc(aiStatus.msg)}</span>` : '';
     return;
   }
-  const base = 'enter to add · shift+enter for new line · #tags · “tomorrow”, “by fri”';
+  const tips = '<span class="tips">enter to add · #tags · “tomorrow”, “by fri”</span>';
   let ai;
   if (aiStatus) ai = `<span class="${aiStatus.warn ? 'warn' : ''}">${esc(aiStatus.msg)}</span>`;
-  else if (aiReady()) ai = `<b>✦ AI sorting on</b> · ${esc(cfg.provider === 'gemini' ? (cfg.aiModel || 'gemini') : 'claude haiku 5.5')}`;
-  else ai = 'rules sorting · add an AI key in settings';
-  $('#hint').innerHTML = `${ai}<br>${base}`;
+  else if (aiReady()) ai = `<span title="${esc(cfg.provider === 'gemini' ? (cfg.aiModel || 'gemini') : 'claude haiku 5.5')}"><b>✦</b> AI sorting</span>`;
+  else ai = '<span title="Add an AI key in settings to sort with AI">rules sorting</span>';
+  $('#hint').innerHTML = `${tips}${ai}`;
 }
 
 function render() {
@@ -1190,6 +1367,9 @@ $('#list').addEventListener('click', e => {
     case 'delete':
       deleteToday(id);
       return;
+    case 'to-blocks':
+      todayToBlock(id);
+      return;
     case 'dismiss-brief':
       try { localStorage.setItem(LS.brief, todayStr()); } catch {}
       renderList();
@@ -1203,39 +1383,104 @@ $('#list').addEventListener('click', e => {
   if (suppressClick) return;
   const el = e.target.closest('[data-bact]');
   if (!el) return;
-  const id = el.closest('.b-item')?.dataset.bid;
+  const id = el.dataset.next || el.closest('.b-item')?.dataset.bid;
   if (!id || !data.blocks[id]) return;
 
   switch (el.dataset.bact) {
     case 'start':
-      logBlockId = null;
       openFocus(null, id); // focus.js
       return;
-    case 'log':
-      logBlockId = logBlockId === id ? null : id;
-      renderList();
-      return;
-    case 'log-len':
-      logBlock(id, +el.dataset.min);
-      return;
-    case 'unlog':
-      removeLastBlock(id);
-      return;
-    case 'goal': {
-      const goal = Math.max(0, Math.min(MAX_PIPS, (data.blocks[id].goal || 0) + +el.dataset.d));
-      updateBlock(id, { goal: goal || null });
+    case 'slot-fill': {
+      const b = data.blocks[id];
+      logBlock(id, b.minutes || DEFAULT_BLOCK);
       return;
     }
+    case 'slot-undo':
+      unlogBlock(el.dataset.rid);
+      return;
+    case 'slot-add': {
+      const b = data.blocks[id];
+      const done = blockRecords(id, todayStr()).length;
+      haptic();
+      updateBlock(id, { goal: Math.min(MAX_PIPS, Math.max(b.goal || 0, done) + 1) });
+      return;
+    }
+    case 'open':
+      openBlockId = openBlockId === id ? null : id;
+      renderList();
+      return;
+    case 'length':
+      updateBlock(id, { minutes: +el.dataset.min });
+      return;
     case 'edit':
       editBlockId = id;
       renderList();
-      { const inp = $('.t-edit'); inp?.focus(); inp?.setSelectionRange(inp.value.length, inp.value.length); }
+      { const inp = $('.t-edit'); inp?.focus(); inp?.select(); }
       return;
     case 'delete':
       deleteBlock(id);
       return;
   }
 });
+
+/* drag across a task's slots to plan more or fewer blocks (mouse or touch) */
+
+let slotDrag = null;
+
+$('#list').addEventListener('pointerdown', e => {
+  const strip = e.target.closest('.b-slots');
+  if (!strip || (e.pointerType === 'mouse' && e.button !== 0)) return;
+  const id = strip.closest('.b-item')?.dataset.bid;
+  const b = id && data.blocks[id];
+  if (!b) return;
+  slotDrag = {
+    strip, id, pointer: e.pointerId, x: e.clientX, y: e.clientY, moved: false,
+    done: +strip.dataset.done, goal: +strip.dataset.goal, n: +strip.dataset.goal,
+  };
+});
+
+$('#list').addEventListener('pointermove', e => {
+  const d = slotDrag;
+  if (!d || e.pointerId !== d.pointer) return;
+  if (!d.moved) {
+    if (Math.abs(e.clientY - d.y) > 12 && Math.abs(e.clientY - d.y) > Math.abs(e.clientX - d.x)) { slotDrag = null; return; }
+    if (Math.abs(e.clientX - d.x) < 8) return;
+    d.moved = true;
+    try { d.strip.setPointerCapture(e.pointerId); } catch {}
+    d.strip.classList.add('dragging');
+  }
+  e.preventDefault();
+  // the slot under the finger is the last planned one; never fewer than what's already done.
+  // Measured live, since the slots shrink as the strip grows.
+  const first = d.strip.firstElementChild.getBoundingClientRect();
+  const second = d.strip.children[1]?.getBoundingClientRect();
+  const pitch = second ? second.left - first.left : first.width + 6;
+  const n = Math.max(d.done, Math.min(MAX_PIPS, Math.floor((e.clientX - first.left) / pitch) + 1));
+  if (n === d.n) return;
+  d.n = n;
+  haptic();
+  const b = data.blocks[d.id];
+  const today = blockRecords(d.id, todayStr()).sort((x, y) => x.startedAt - y.startedAt);
+  d.strip.dataset.size = slotSize(n);
+  d.strip.innerHTML = slotsHTML(b, today, n);
+  d.strip.closest('.b-row').querySelector('.b-count')?.replaceChildren(
+    document.createTextNode(String(today.length)),
+    Object.assign(document.createElement('small'), { textContent: n ? `/${n}` : '' }));
+});
+
+function endSlotDrag(e) {
+  const d = slotDrag;
+  if (!d || e.pointerId !== d.pointer) return;
+  slotDrag = null;
+  if (!d.moved) return; // a tap: the click handler takes it
+  suppressClick = true;
+  setTimeout(() => { suppressClick = false; }, 60);
+  d.strip.classList.remove('dragging');
+  if (d.n !== d.goal) updateBlock(d.id, { goal: d.n || null });
+  else renderList();
+}
+$('#list').addEventListener('pointerup', endSlotDrag);
+$('#list').addEventListener('pointercancel', endSlotDrag);
 
 $('#list').addEventListener('submit', e => {
   if (e.target.id !== 'bAdd') return;
@@ -1244,7 +1489,8 @@ $('#list').addEventListener('submit', e => {
   const text = inp.value.trim();
   if (!text) return;
   inp.value = '';
-  addBlock(text);
+  const parsed = parseBlockLine(text);
+  addBlock(parsed ? parsed.name : text, parsed?.goal);
   $('#bAddInput')?.focus();
 });
 
@@ -1285,7 +1531,8 @@ function finishTodayEdit(inp, save) {
   editTodayId = null;
   const text = inp.value.trim();
   const e = data.today[id];
-  if (save && e && text && text !== e.text) updateToday(id, { text });
+  if (save && e && text && parseBlockLine(text)) { data.today[id] = { ...e, text }; todayToBlock(id); }
+  else if (save && e && text && text !== e.text) updateToday(id, { text });
   else if (save && e && !text) deleteToday(id);
   else renderList();
 }
@@ -1301,7 +1548,11 @@ $('#list').addEventListener('focusout', e => {
   else finishTodayEdit(e.target, !e.target.dataset.cancel);
 });
 
-/* drag the ⋮⋮ handle to reorder (mouse or touch) */
+$('#list').addEventListener('pointerdown', e => {
+  if (e.target.closest('[data-tact=to-blocks]')) e.preventDefault();
+});
+
+/* drag the ⋮⋮ handle to reorder (mouse or touch), or up into the blocks box to track it in blocks */
 
 let reorder = null;
 
@@ -1313,6 +1564,7 @@ $('#list').addEventListener('pointerdown', e => {
   reorder = { row, list: row.parentElement, id: e.pointerId, startY: e.clientY };
   try { handle.setPointerCapture(e.pointerId); } catch {}
   row.classList.add('lifted');
+  $('.b-sec')?.classList.add('drop-ready');
   haptic();
 });
 
@@ -1320,11 +1572,31 @@ $('#list').addEventListener('pointermove', e => {
   if (!reorder || e.pointerId !== reorder.id) return;
   e.preventDefault();
   const { row, list } = reorder;
+
+  // near the top edge, scroll up so the blocks box can be reached from further down the list
+  const edge = $('#scroller').getBoundingClientRect().top + 48;
+  if (e.clientY < edge && $('#scroller').scrollTop > 0) {
+    const before = $('#scroller').scrollTop;
+    $('#scroller').scrollTop = Math.max(0, before - 14);
+    reorder.startY += before - $('#scroller').scrollTop;
+  }
+
+  // over the blocks box: dropping here moves the entry into blocks
+  const box = $('.b-sec');
+  const over = !!box && e.clientY < box.getBoundingClientRect().bottom - 6;
+  if (over !== !!reorder.over) {
+    reorder.over = over;
+    box.classList.toggle('drop-target', over);
+    row.classList.toggle('to-blocks', over);
+    if (over) haptic();
+  }
+
   const center = row.offsetTop + row.offsetHeight / 2 + (e.clientY - reorder.startY);
   const prev = row.previousElementSibling;
   const next = row.nextElementSibling;
   // swap with a neighbour once the dragged row passes its middle
-  if (next && center > next.offsetTop + next.offsetHeight / 2) {
+  if (over) { /* hold position while hovering the box */ }
+  else if (next && center > next.offsetTop + next.offsetHeight / 2) {
     const before = row.offsetTop;
     list.insertBefore(next, row);
     reorder.startY += row.offsetTop - before;
@@ -1338,10 +1610,16 @@ $('#list').addEventListener('pointermove', e => {
 
 function endReorder(e) {
   if (!reorder || e.pointerId !== reorder.id) return;
-  const { row, list } = reorder;
+  const { row, list, over } = reorder;
   reorder = null;
+  $('.b-sec')?.classList.remove('drop-target', 'drop-ready');
+  if (over && e.type === 'pointerup') {
+    row.classList.add('absorbed');
+    setTimeout(() => todayToBlock(row.dataset.id), 160);
+    return;
+  }
   row.style.transform = '';
-  row.classList.remove('lifted');
+  row.classList.remove('lifted', 'to-blocks');
   let changed = false;
   [...list.children].forEach((li, i) => {
     const entry = data.today[li.dataset.id];
@@ -1368,7 +1646,7 @@ $('#list').addEventListener('pointerdown', e => {
   if (e.pointerType === 'mouse' || drag) return;
   const card = e.target.closest('.item, .t-row');
   const row = card?.closest('.swipe-row');
-  if (!row || row.dataset.id === openId || e.target.closest('input, textarea, a, .t-handle')) return;
+  if (!row || row.dataset.id === openId || e.target.closest('input, textarea, a, .t-handle, .b-slots')) return;
   drag = { row, card, id: e.pointerId, x: e.clientX, y: e.clientY, dx: 0, active: false, armed: false };
 });
 
@@ -1449,7 +1727,7 @@ $('#list').addEventListener('change', e => {
 
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && openId && !$('#settings').open) { openId = null; renderList(); }
-  if (e.key === 'Escape' && logBlockId && !$('#settings').open) { logBlockId = null; renderList(); }
+  if (e.key === 'Escape' && openBlockId && !$('#settings').open) { openBlockId = null; renderList(); }
   if (e.key === '/' && document.activeElement === document.body) { e.preventDefault(); input.focus(); }
 });
 
@@ -1470,8 +1748,17 @@ window.addEventListener('offline', () => setSync('offline'));
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') { rollover(); sync(); processQueue(); render(); }
 });
+// slide the day ring's "now" dot along without re-rendering the list
+function tickRing() {
+  const a = clockAngle(now());
+  const [x, y] = polar(92, a);
+  document.querySelectorAll('.dr-now, .dr-now-halo').forEach(c => { c.setAttribute('cx', x.toFixed(2)); c.setAttribute('cy', y.toFixed(2)); });
+  document.querySelector('.dr-elapsed')?.setAttribute('d', arcPath(92, 0, a));
+}
+
 let lastDay = todayStr();
 setInterval(() => {
+  tickRing();
   if (todayStr() !== lastDay) { lastDay = todayStr(); rollover(); render(); } // midnight while open
   if (document.visibilityState === 'visible') { sync(); processQueue(); }
 }, 60000);
