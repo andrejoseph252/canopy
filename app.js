@@ -194,8 +194,17 @@ const DEFAULT_BLOCK = 35;
 
 // blocks are set up fresh each day: a task belongs to the day it was added (or brought back) on, and the
 // box starts empty the next morning. The task keeps its id, so its history and week chart carry on.
+// Never drop a task you're using today: one with no day (made before blocks reset daily, or by an older
+// copy of the app on another device) counts as today's if it was set up or changed today, and any task
+// with a block logged today stays, whatever its day says.
+function isTodayBlock(b, t = todayStr()) {
+  if (b.deleted) return false;
+  if (b.day === t) return true;
+  if (!b.day && b.updated && ymd(new Date(b.updated)) === t) return true;
+  return Object.values(data.focus).some(f => !f.deleted && f.completed && f.blockId === b.id && f.day === t);
+}
 const liveBlocks = () => Object.values(data.blocks)
-  .filter(b => !b.deleted && b.day === todayStr())
+  .filter(b => isTodayBlock(b))
   .sort((a, b) => (a.order ?? a.created) - (b.order ?? b.created));
 
 // block tasks from earlier days that aren't on today yet, most recent first: one tap brings them back
@@ -204,7 +213,7 @@ function recentBlocks(limit = 4) {
   const onToday = new Set(liveBlocks().map(b => b.name.toLowerCase()));
   const lastUsed = b => Math.max(b.updated || 0, ...blockRecords(b.id).map(r => r.startedAt || 0));
   return Object.values(data.blocks)
-    .filter(b => !b.deleted && b.day !== t && !onToday.has(b.name.toLowerCase()))
+    .filter(b => !b.deleted && !isTodayBlock(b, t) && !onToday.has(b.name.toLowerCase()))
     .map(b => [b, lastUsed(b)])
     .filter(([, at]) => at > now() - 30 * DAY_MS)
     .sort((a, b) => b[1] - a[1])
@@ -227,9 +236,9 @@ function addBlock(name, goal = null) {
     || Object.values(data.blocks).filter(same).sort((a, b) => b.updated - a.updated)[0];
   const order = Math.max(-1, ...liveBlocks().map(b => b.order ?? -1)) + 1;
   if (existing) {
-    const isToday = !existing.deleted && existing.day === todayStr();
+    const isToday = isTodayBlock(existing);
     // back from an earlier day: a fresh plan for today (the goal starts over unless one is given)
-    updateBlock(existing.id, isToday ? (goal ? { goal } : {}) : { deleted: false, day: todayStr(), goal, order });
+    updateBlock(existing.id, isToday ? { day: todayStr(), ...(goal ? { goal } : {}) } : { deleted: false, day: todayStr(), goal, order });
     if (!isToday) freshToday.add(existing.id);
     return existing.id;
   }
@@ -1163,10 +1172,6 @@ function blockRow(b, i = 0) {
   const met = goal && today.length >= goal;
   const open = openBlockId === b.id;
 
-  // a word of help until the strip has been used once
-  const hint = !goal && !today.length ? 'tap + or drag to plan blocks'
-    : !blockRecords().length && goal ? 'tap a block when it’s done' : '';
-  const meta = mins ? fmtMinutes(mins) : hint;
   const name = editBlockId === b.id
     ? `<input class="t-edit" data-bid="${esc(b.id)}" value="${esc(b.name)}" enterkeyhint="done" aria-label="Rename">`
     : `<button type="button" class="t-text b-name" data-bact="open" aria-expanded="${open}" title="Week, length, rename">${esc(b.name)}</button>`;
@@ -1176,14 +1181,8 @@ function blockRow(b, i = 0) {
       <div class="swipe-bg" aria-hidden="true"><span class="sb-done">+1 block · ${b.minutes}m</span><span class="sb-del">remove ✕</span></div>
       <div class="t-row b-row${freshToday.has(b.id) ? ' fresh' : ''}${met ? ' met' : ''}">
         <button class="b-start" data-bact="start" aria-label="Start a ${b.minutes} minute block of ${esc(b.name)}" title="Start a ${b.minutes}m block">${RING}</button>
-        <div class="b-main">
-          ${name}
-          <div class="b-track">
-            <div class="b-slots" data-size="${slotSize(Math.max(goal, today.length))}" data-goal="${goal}" data-done="${today.length}" role="group" aria-label="${today.length} of ${Math.max(goal, today.length)} blocks done">${slotsHTML(b, today, goal)}</div>
-            ${meta ? `<span class="b-meta-t${mins ? '' : ' hint'}">${esc(meta)}</span>` : ''}
-          </div>
-        </div>
-        ${goal || today.length ? `<span class="b-count" aria-hidden="true">${today.length}${goal ? `<small>/${goal}</small>` : ''}</span>` : ''}
+        <div class="b-main">${name}</div>
+        <div class="b-slots" data-size="${slotSize(Math.max(goal, today.length))}" data-goal="${goal}" data-done="${today.length}" role="group" aria-label="${today.length} of ${Math.max(goal, today.length)} blocks done${mins ? `, ${fmtMinutes(mins)}` : ''}" title="${mins ? `${fmtMinutes(mins)} today` : 'Tap + or drag to plan blocks'}">${slotsHTML(b, today, goal)}</div>
       </div>
     </div>
     ${open ? blockDrawer(b, all) : ''}
@@ -1256,128 +1255,18 @@ function listsView() {
   </div>`;
 }
 
-/* ---------- the day ring: a 24-hour dial with a lane per block task ---------- */
-
-// midnight at the top, clockwise. Every block (and other focus session) is an arc at the time it happened,
-// on its task's lane, so a long stretch of deep work reads as one sweep. The dot is now.
-
-const LANES = 5;
-const seenArcs = new Set(); // arcs already drawn once; new ones grow in
-const clockAngle = ms => { const d = new Date(ms); return ((d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60) / 1440) * 360; };
+const LANES = 5; // one color per block task, in the order they were added
 const clockText = ms => new Date(ms).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }).toLowerCase().replace(/\s/g, '');
-
-function polar(r, deg) {
-  const t = (deg - 90) * Math.PI / 180;
-  return [100 + r * Math.cos(t), 100 + r * Math.sin(t)];
-}
-
-function arcPath(r, a0, a1) {
-  const [x0, y0] = polar(r, a0), [x1, y1] = polar(r, Math.max(a1, a0 + 0.01));
-  return `M${x0.toFixed(2)} ${y0.toFixed(2)}A${r} ${r} 0 ${a1 - a0 > 180 ? 1 : 0} 1 ${x1.toFixed(2)} ${y1.toFixed(2)}`;
-}
-
-function dayRing(blocks) {
-  const t = todayStr();
-  const sessions = Object.values(data.focus).filter(f => !f.deleted && f.day === t && f.minutes);
-  const lane = new Map(blocks.map((b, i) => [b.id, i]));
-  const others = sessions.filter(f => !(f.completed && lane.has(f.blockId)));
-  const lanes = Math.min(blocks.length, LANES) + (others.length ? 1 : 0);
-  const outer = 82, inner = 54;
-  const step = Math.min(10, (outer - inner) / Math.max(1, lanes - 1));
-  const radius = i => outer - i * step;
-  const width = Math.max(3, Math.min(7.5, step * 0.72));
-
-  const ticks = Array.from({ length: 24 }, (_, h) => {
-    const major = h % 6 === 0;
-    const [x0, y0] = polar(major ? 89 : 91, h * 15), [x1, y1] = polar(95, h * 15);
-    return `<line class="dr-tick${major ? ' major' : ''}" x1="${x0.toFixed(1)}" y1="${y0.toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}"/>`;
-  }).join('');
-
-  const tracks = Array.from({ length: lanes }, (_, i) =>
-    `<circle class="dr-track" cx="100" cy="100" r="${radius(i)}" style="stroke-width:${(width * 0.6).toFixed(2)}${i < blocks.length ? `;--bc:var(--lane-${i % LANES})` : ''}"/>`).join('');
-
-  const arcs = sessions.map(f => {
-    const isBlock = f.completed && lane.has(f.blockId);
-    const li = isBlock ? Math.min(lane.get(f.blockId), LANES - 1) : lanes - 1;
-    const end = f.startedAt + f.minutes * 60000;
-    const a0 = clockAngle(f.startedAt);
-    const a1 = a0 + (f.minutes / 1440) * 360;
-    const isNew = !seenArcs.has(f.id);
-    // while the focus screen covers the list, save the grow-in for when it closes
-    if (typeof focusState === 'undefined' || focusState === 'closed') seenArcs.add(f.id);
-    return `<path class="dr-arc${isBlock ? '' : ' other'}${isNew ? ' grow' : ''}" pathLength="1" d="${arcPath(radius(li), a0, a1)}"
-      style="stroke-width:${isBlock ? width : Math.max(2, width * 0.55)}${isBlock ? `;--bc:var(--lane-${lane.get(f.blockId) % LANES})` : ''}">
-      <title>${esc(f.subject || 'focus')} · ${clockText(f.startedAt)}–${clockText(end)}${isBlock ? '' : f.completed ? '' : ' (ended early)'}</title></path>`;
-  }).join('');
-
-  const nowA = clockAngle(now());
-  const [nx, ny] = polar(92, nowA);
-  const elapsed = `<path class="dr-elapsed" d="${arcPath(92, 0, nowA)}"/>`;
-  const done = blockRecords(null, t).length;
-  const goals = blocks.reduce((sum, b) => sum + (b.goal || 0), 0);
-
-  return `<div class="dr" role="img" aria-label="${done} blocks today${goals ? ` of ${goals}` : ''}">
-    <svg viewBox="0 0 200 200" aria-hidden="true">
-      ${ticks}${elapsed}${tracks}${arcs}
-      <circle class="dr-now-halo" cx="${nx.toFixed(2)}" cy="${ny.toFixed(2)}" r="5"/>
-      <circle class="dr-now" cx="${nx.toFixed(2)}" cy="${ny.toFixed(2)}" r="2.6"/>
-    </svg>
-    <div class="dr-center"><span class="dr-big">${done}${goals ? `<small>/${goals}</small>` : ''}</span><span class="dr-unit">blocks</span></div>
-  </div>`;
-}
-
-// the next thing to put a block into: the first task still short of its goal, else the one you used last
-function nextBlock(blocks) {
-  const t = todayStr();
-  const count = b => blockRecords(b.id, t).length;
-  const short = blocks.find(b => b.goal && count(b) < b.goal);
-  if (short) return short;
-  if (blocks.some(b => b.goal)) return null; // every goal met
-  const last = blockRecords(null, t).sort((a, b) => b.startedAt - a.startedAt)[0];
-  return (last && blocks.find(b => b.id === last.blockId)) || blocks[0] || null;
-}
-
-function dayHero(blocks) {
-  const t = todayStr();
-  const recs = blockRecords(null, t).sort((a, b) => a.startedAt - b.startedAt);
-  const goals = blocks.reduce((sum, b) => sum + (b.goal || 0), 0);
-  const toGo = blocks.reduce((sum, b) => sum + Math.max(0, (b.goal || 0) - blockRecords(b.id, t).length), 0);
-  const mins = recs.reduce((sum, r) => sum + r.minutes, 0);
-  const next = nextBlock(blocks);
-  const nextIdx = next ? blocks.indexOf(next) : 0;
-
-  const headline = goals && !toGo ? 'All goals met'
-    : goals ? `${toGo} block${toGo === 1 ? '' : 's'} to go`
-    : recs.length ? `${recs.length} block${recs.length === 1 ? '' : 's'} in`
-    : 'Ready when you are';
-  const meta = recs.length
-    ? `${fmtMinutes(mins)} in blocks · since ${clockText(recs[0].startedAt)}`
-    : goals ? `${goals} planned today` : 'tap + to plan your blocks';
-  const cta = next
-    ? `<button type="button" class="dr-next" data-bact="start" data-next="${esc(next.id)}" title="Start a ${next.minutes}m block of ${esc(next.name)}" style="--bc:var(--lane-${nextIdx % LANES})">
-        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.5v9l7.5-4.5z" fill="currentColor"/></svg>
-        <span class="dr-next-name">${esc(next.name)}</span>
-        <span class="dr-next-n">${next.minutes}m</span>
-      </button>`
-    : `<span class="dr-done">✓ nice work</span>`;
-
-  return `<div class="dr-hero${goals && !toGo ? ' met' : ''}">
-    ${dayRing(blocks)}
-    <div class="dr-info">
-      <span class="b-title">${RING}blocks</span>
-      <span class="dr-headline">${esc(headline)}</span>
-      <span class="dr-meta">${esc(meta)}</span>
-      ${cta}
-    </div>
-  </div>`;
-}
 
 // the box at the top of Today: the work your day is built around
 function blocksSection() {
   const blocks = liveBlocks();
   const recent = recentBlocks(blocks.length ? 3 : 4);
+  const t = todayStr();
+  const done = blockRecords(null, t).filter(r => blocks.some(b => b.id === r.blockId)).length;
+  const goals = blocks.reduce((sum, b) => sum + (b.goal || 0), 0);
   return `<div class="b-sec${blocks.length ? '' : ' empty'}" aria-label="Blocks">
-    ${blocks.length ? dayHero(blocks) : `<div class="b-head"><span class="b-title">${RING}blocks</span></div>`}
+    <div class="b-head"><span class="b-title">${RING}blocks</span>${goals || done ? `<span class="b-sum${goals && done >= goals ? ' met' : ''}">${done}${goals ? `/${goals}` : ''}</span>` : ''}</div>
     ${blocks.length ? `<ul class="b-list">${blocks.map(blockRow).join('')}</ul>` : ''}
     <form class="t-add b-add" id="bAdd" autocomplete="off">
       <span class="t-plus" aria-hidden="true">+</span>
@@ -1846,6 +1735,7 @@ function finishListEdit(inp, save) {
 /* drag across a task's slots to plan more or fewer blocks (mouse or touch) */
 
 let slotDrag = null;
+const SLOT_STEP = 34; // px of drag per block planned: steady, whatever size the slots are drawn at
 
 $('#list').addEventListener('pointerdown', e => {
   const strip = e.target.closest('.b-slots');
@@ -1864,18 +1754,17 @@ $('#list').addEventListener('pointermove', e => {
   if (!d || e.pointerId !== d.pointer) return;
   if (!d.moved) {
     if (Math.abs(e.clientY - d.y) > 12 && Math.abs(e.clientY - d.y) > Math.abs(e.clientX - d.x)) { slotDrag = null; return; }
-    if (Math.abs(e.clientX - d.x) < 8) return;
+    if (Math.abs(e.clientX - d.x) < 14) return;
     d.moved = true;
     try { d.strip.setPointerCapture(e.pointerId); } catch {}
     d.strip.classList.add('dragging');
   }
   e.preventDefault();
-  // the slot under the finger is the last planned one; never fewer than what's already done.
-  // Measured live, since the slots shrink as the strip grows.
-  const first = d.strip.firstElementChild.getBoundingClientRect();
-  const second = d.strip.children[1]?.getBoundingClientRect();
-  const pitch = second ? second.left - first.left : first.width + 6;
-  const n = Math.max(d.done, Math.min(MAX_PIPS, Math.floor((e.clientX - first.left) / pitch) + 1));
+  // one block per full step of movement from the start of the drag, right for more, left for fewer;
+  // never fewer than what's already done. Relative to the finger, not the slots, since the strip
+  // moves and resizes as it grows.
+  const steps = Math.trunc((e.clientX - d.x) / SLOT_STEP);
+  const n = Math.max(d.done, Math.min(MAX_PIPS, Math.max(d.goal, d.done) + steps));
   if (n === d.n) return;
   d.n = n;
   haptic();
@@ -1883,9 +1772,6 @@ $('#list').addEventListener('pointermove', e => {
   const today = blockRecords(d.id, todayStr()).sort((x, y) => x.startedAt - y.startedAt);
   d.strip.dataset.size = slotSize(n);
   d.strip.innerHTML = slotsHTML(b, today, n);
-  d.strip.closest('.b-row').querySelector('.b-count')?.replaceChildren(
-    document.createTextNode(String(today.length)),
-    Object.assign(document.createElement('small'), { textContent: n ? `/${n}` : '' }));
 });
 
 function endSlotDrag(e) {
@@ -1970,7 +1856,8 @@ $('#list').addEventListener('focusout', e => {
 });
 
 $('#list').addEventListener('pointerdown', e => {
-  if (e.target.closest('[data-tact=to-blocks]')) e.preventDefault();
+  // keep the field focused while these are pressed (the "again" chips only show while you're adding)
+  if (e.target.closest('[data-tact=to-blocks], [data-bact=again]')) e.preventDefault();
 });
 
 /* drag the ⋮⋮ handle to reorder (mouse or touch), or up into the blocks box to track it in blocks */
@@ -2174,17 +2061,9 @@ window.addEventListener('offline', () => setSync('offline'));
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') { rollover(); sync(); processQueue(); render(); }
 });
-// slide the day ring's "now" dot along without re-rendering the list
-function tickRing() {
-  const a = clockAngle(now());
-  const [x, y] = polar(92, a);
-  document.querySelectorAll('.dr-now, .dr-now-halo').forEach(c => { c.setAttribute('cx', x.toFixed(2)); c.setAttribute('cy', y.toFixed(2)); });
-  document.querySelector('.dr-elapsed')?.setAttribute('d', arcPath(92, 0, a));
-}
 
 let lastDay = todayStr();
 setInterval(() => {
-  tickRing();
   if (todayStr() !== lastDay) { lastDay = todayStr(); rollover(); render(); } // midnight while open
   if (document.visibilityState === 'visible') { sync(); processQueue(); }
 }, 60000);

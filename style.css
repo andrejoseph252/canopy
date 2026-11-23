@@ -36,7 +36,7 @@
 
   --radius: 14px;
 
-  /* one color per block task: the day ring's lanes and the task's row share it */
+  /* one color per block task, shared by its row and its slots */
   --lane-0: var(--accent);
   --lane-1: var(--k-look);
   --lane-2: var(--k-get);
@@ -966,60 +966,6 @@ button.b-main:active .b-name { opacity: .7; }
 .focus-presets { display: flex; justify-content: center; gap: 8px; }
 .focus-presets .t-chip { padding: 6px 14px; font-family: var(--mono); font-size: 12px; }
 
-/* ---------- the day ring ---------- */
-.b-sec:not(.empty) { padding-top: 6px; }
-.dr-hero { display: flex; align-items: center; gap: 18px; padding: 8px 10px 12px 6px; }
-.dr { position: relative; flex: none; width: 168px; aspect-ratio: 1; }
-.dr svg { display: block; width: 100%; height: 100%; overflow: visible; }
-.dr-tick { stroke: var(--line2); stroke-width: 1; stroke-linecap: round; }
-.dr-tick.major { stroke: var(--faint); stroke-width: 1.4; }
-.dr-elapsed { fill: none; stroke: color-mix(in srgb, var(--accent) 30%, transparent); stroke-width: 1.4; stroke-linecap: round; }
-.dr-track { fill: none; stroke: color-mix(in srgb, var(--bc, var(--faint)) 14%, var(--line)); }
-.dr-arc {
-  fill: none; stroke: var(--bc, var(--accent)); stroke-linecap: round;
-  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--bc, var(--accent)) 70%, transparent));
-}
-.dr-arc.other { stroke: var(--muted); filter: none; opacity: .75; }
-.dr-arc.grow { stroke-dasharray: 1 2; stroke-dashoffset: 1; animation: dr-grow 1.1s cubic-bezier(.2, .8, .2, 1) forwards; }
-@keyframes dr-grow { to { stroke-dashoffset: 0; } }
-.dr-now { fill: var(--accent); }
-.dr-now-halo { fill: var(--accent); opacity: .25; transform-box: fill-box; transform-origin: center; animation: dr-breathe 2.8s ease-in-out infinite; }
-@keyframes dr-breathe { 50% { opacity: .05; transform: scale(1.9); } }
-
-.dr-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; pointer-events: none; }
-.dr-big { font-family: var(--mono); font-size: 34px; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -.03em; color: var(--text); }
-.dr-big small { font-size: 14px; letter-spacing: 0; color: var(--faint); }
-.dr-unit { margin-top: 5px; font-family: var(--mono); font-size: 9px; letter-spacing: .16em; text-transform: uppercase; color: var(--faint); }
-.dr-hero.met .dr-big, .dr-hero.met .dr-big small { color: var(--accent); text-shadow: 0 0 18px var(--glow-strong); }
-
-.dr-info { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
-.dr-headline { font-size: 21px; font-weight: 600; line-height: 1.15; letter-spacing: -.01em; }
-.dr-hero.met .dr-headline { color: var(--accent); }
-.dr-meta { font-family: var(--mono); font-size: 11px; color: var(--muted); }
-.dr-next {
-  max-width: 100%;
-  display: inline-flex; align-items: center; gap: 8px;
-  margin-top: 6px; padding: 8px 12px 8px 10px;
-  font-size: 14px; font-weight: 500; color: var(--bc);
-  background: color-mix(in srgb, var(--bc) 13%, transparent);
-  border: 1px solid color-mix(in srgb, var(--bc) 42%, transparent);
-  border-radius: 999px;
-  transition: transform .12s, background .15s, box-shadow .15s;
-}
-.dr-next svg { width: 14px; height: 14px; flex: none; }
-.dr-next-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
-.dr-next-n { flex: none; font-family: var(--mono); font-size: 11px; opacity: .85; }
-.dr-next:active { transform: scale(.96); }
-@media (hover: hover) { .dr-next:hover { background: color-mix(in srgb, var(--bc) 20%, transparent); box-shadow: 0 0 18px -6px var(--bc); } }
-.dr-done { margin-top: 4px; font-family: var(--mono); font-size: 12px; color: var(--accent); }
-
-@media (max-width: 420px) {
-  .dr-hero { gap: 14px; padding-right: 6px; }
-  .dr { width: 124px; }
-  .dr-big { font-size: 26px; }
-  .dr-headline { font-size: 18px; }
-}
-
 /* the task's lane color runs through its row */
 .b-item .b-start {
   color: var(--bc);
@@ -1093,26 +1039,6 @@ button.b-name { max-width: 100%; text-align: left; overflow-wrap: anywhere; }
 .b-meta-t.hint { color: var(--faint); }
 .b-row { align-items: center; min-height: 72px; }
 
-/* the day ring stays a compact summary, not the centerpiece */
-.dr-hero { gap: 12px; padding: 4px 8px 8px 6px; }
-.dr { width: 76px; }
-.dr-tick:not(.major) { display: none; }
-.dr-tick.major { stroke-width: 2.4; }
-.dr-elapsed { stroke-width: 2.6; }
-.dr-big { font-size: 19px; letter-spacing: -.02em; }
-.dr-big small { font-size: 11px; }
-.dr-unit { display: none; }
-.dr-info { gap: 3px; }
-.dr-info .b-title { display: none; }
-.dr-headline { font-size: 16px; font-weight: 600; }
-.dr-meta { font-size: 10.5px; }
-.dr-next { margin-top: 5px; padding: 5px 10px 5px 8px; gap: 6px; font-size: 13px; }
-.dr-next svg { width: 12px; height: 12px; }
-@media (max-width: 420px) {
-  .dr { width: 68px; }
-  .dr-big { font-size: 17px; }
-  .dr-headline { font-size: 15px; }
-}
 
 /* dragging a Today entry: the blocks box offers itself as a drop target */
 .b-sec { position: relative; transition: border-color .2s, background .2s, box-shadow .2s; }
@@ -1254,7 +1180,7 @@ button.b-name { max-width: 100%; text-align: left; overflow-wrap: anywhere; }
 }
 
 /* the display face: soft, a little wonky */
-.brand span, .today-title, .section-name, .l-name span, .l-rename, .dr-headline, .empty b, .dlg h2 {
+.brand span, .today-title, .section-name, .l-name span, .l-rename, .empty b, .dlg h2 {
   font-family: var(--display);
   font-variation-settings: 'SOFT' 100, 'WONK' 1;
 }
@@ -1325,9 +1251,6 @@ button.b-name { max-width: 100%; text-align: left; overflow-wrap: anywhere; }
 .today-count.all { background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); }
 @keyframes bob { 50% { transform: translateY(-2px) rotate(-6deg); } }
 
-/* blocks: the headline gets the display face too */
-.dr-headline { font-size: 19px; font-weight: 600; font-style: italic; letter-spacing: -.01em; }
-@media (max-width: 420px) { .dr-headline { font-size: 18px; } }
 
 /* checking things off: the box springs, the text settles */
 .t-row.pop .t-check, .l-row.pop .t-check { animation: pop .5s cubic-bezier(.3, 1.8, .5, 1); }
@@ -1383,3 +1306,25 @@ button.b-name { max-width: 100%; text-align: left; overflow-wrap: anywhere; }
 
 /* inbox: color the kind's check ring a touch more */
 .check { border-width: 2px; }
+
+/* ---------- blocks, compact: one line per task (start · name · slots) ---------- */
+.b-sec { padding: 8px 4px 2px; }
+.b-sec.empty { padding-bottom: 0; }
+.b-head { justify-content: space-between; padding: 0 10px 2px; }
+.b-sum { font-family: var(--mono); font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.b-sum.met { color: var(--accent); }
+.b-row { gap: 10px; min-height: 48px; padding: 4px 6px 4px 8px; }
+.b-main { flex: 1; min-width: 0; padding: 0; }
+button.b-name { max-width: 100%; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; }
+.b-start { width: 30px; height: 30px; }
+.b-start svg { width: 16px; height: 16px; }
+.b-slots { --s: 22px; flex: none; gap: 5px; }
+.b-slots[data-size=m] { --s: 18px; gap: 4px; }
+.b-slots[data-size=s] { --s: 14px; gap: 3px; }
+.b-slot { border-radius: 7px; }
+.b-slot.add { font-size: 13px; }
+.b-add input { padding: 8px 0; }
+.b-recent { padding-top: 0; }
+/* once today's blocks are set, last time's chips only show while you're adding */
+.b-sec:not(.empty) .b-recent { display: none; }
+.b-sec:not(.empty):focus-within .b-recent { display: flex; }
