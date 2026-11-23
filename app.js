@@ -45,6 +45,8 @@ data.items ||= {};
 data.today ||= {};
 data.focus ||= {};
 data.blocks ||= {};
+data.lists ||= {};
+data.listItems ||= {};
 data.examples ||= [];
 
 // aiKey / aiModel are the Gemini settings (named before Claude was added)
@@ -65,6 +67,9 @@ const freshToday = new Set();
 let editTodayId = null;
 let editBlockId = null;
 let openBlockId = null; // the block row whose drawer (week, lengths, goal) is open
+let editListItemId = null;
+let editListId = null; // the list being renamed
+let menuListId = null; // the list whose ⋯ menu is open
 let aiStatus = '';
 
 const providerKey = c => (c.provider === 'gemini' ? c.aiKey : c.claudeKey);
@@ -146,7 +151,10 @@ function toggleToday(id) {
   // an entry added from the inbox completes that item too
   const it = e.ref && data.items[e.ref];
   if (it && !it.deleted && it.done !== done) data.items[e.ref] = { ...it, done, doneAt: done ? t : null, updated: t };
+  if (done) { popped.add(id); burst(); }
   commit();
+  const list = liveToday();
+  if (done && list.length >= 2 && list.every(x => x.done)) { confetti(); toast('Today: all done 🎉'); }
 }
 
 function deleteToday(id) {
@@ -184,7 +192,25 @@ const fmtMinutes = m => (m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60 ? ` 
 const BLOCK_LENGTHS = [20, 35, 45];
 const DEFAULT_BLOCK = 35;
 
-const liveBlocks = () => Object.values(data.blocks).filter(b => !b.deleted).sort((a, b) => a.created - b.created);
+// blocks are set up fresh each day: a task belongs to the day it was added (or brought back) on, and the
+// box starts empty the next morning. The task keeps its id, so its history and week chart carry on.
+const liveBlocks = () => Object.values(data.blocks)
+  .filter(b => !b.deleted && b.day === todayStr())
+  .sort((a, b) => (a.order ?? a.created) - (b.order ?? b.created));
+
+// block tasks from earlier days that aren't on today yet, most recent first: one tap brings them back
+function recentBlocks(limit = 4) {
+  const t = todayStr();
+  const onToday = new Set(liveBlocks().map(b => b.name.toLowerCase()));
+  const lastUsed = b => Math.max(b.updated || 0, ...blockRecords(b.id).map(r => r.startedAt || 0));
+  return Object.values(data.blocks)
+    .filter(b => !b.deleted && b.day !== t && !onToday.has(b.name.toLowerCase()))
+    .map(b => [b, lastUsed(b)])
+    .filter(([, at]) => at > now() - 30 * DAY_MS)
+    .sort((a, b) => b[1] - a[1])
+    .map(([b]) => b)
+    .slice(0, limit);
+}
 
 const blockRecords = (blockId = null, fromDay = '') => Object.values(data.focus)
   .filter(f => !f.deleted && f.completed && f.blockId && (!blockId || f.blockId === blockId) && f.day >= fromDay);
@@ -198,13 +224,17 @@ function addBlock(name, goal = null) {
   if (!name) return null;
   const same = b => b.name.toLowerCase() === name.toLowerCase();
   const existing = liveBlocks().find(same)
-    || Object.values(data.blocks).filter(b => b.deleted && same(b)).sort((a, b) => b.updated - a.updated)[0];
+    || Object.values(data.blocks).filter(same).sort((a, b) => b.updated - a.updated)[0];
+  const order = Math.max(-1, ...liveBlocks().map(b => b.order ?? -1)) + 1;
   if (existing) {
-    updateBlock(existing.id, { deleted: false, ...(goal ? { goal } : {}) });
+    const isToday = !existing.deleted && existing.day === todayStr();
+    // back from an earlier day: a fresh plan for today (the goal starts over unless one is given)
+    updateBlock(existing.id, isToday ? (goal ? { goal } : {}) : { deleted: false, day: todayStr(), goal, order });
+    if (!isToday) freshToday.add(existing.id);
     return existing.id;
   }
   const t = now();
-  const b = { id: uid(), name, minutes: DEFAULT_BLOCK, goal, created: t, updated: t };
+  const b = { id: uid(), name, minutes: DEFAULT_BLOCK, goal, day: todayStr(), order, created: t, updated: t };
   data.blocks[b.id] = b;
   freshToday.add(b.id);
   commit();
@@ -217,12 +247,17 @@ function todayToBlock(id) {
   if (!e) return;
   const parsed = parseBlockLine(e.text) || { name: e.text, goal: null };
   editTodayId = null;
-  const wasNew = !liveBlocks().some(b => b.name.toLowerCase() === parsed.name.toLowerCase());
+  const same = b => b.name.toLowerCase() === parsed.name.toLowerCase();
+  const wasOnToday = liveBlocks().some(same);
+  const before = Object.fromEntries(Object.values(data.blocks).filter(same).map(b => [b.id, b]));
   const bid = addBlock(parsed.name, parsed.goal);
   updateToday(id, { deleted: true });
   toast(`Moved ${parsed.name} to blocks`, () => {
     updateToday(id, { deleted: false });
-    if (wasNew) updateBlock(bid, { deleted: true });
+    if (wasOnToday) return;
+    // put the task back the way it was (a task from an earlier day goes back to being a suggestion)
+    if (before[bid]) { data.blocks[bid] = { ...before[bid], updated: now() }; commit(); }
+    else updateBlock(bid, { deleted: true });
   });
 }
 
@@ -250,10 +285,12 @@ function logBlock(id, minutes) {
     planned: minutes, minutes, completed: true, manual: true, startedAt: t - minutes * 60000, updated: t,
   };
   data.focus[rec.id] = rec;
-  commit();
   const n = blockRecords(id, todayStr()).length;
+  burst(cssVar(`--lane-${Math.max(0, liveBlocks().findIndex(x => x.id === id)) % LANES}`));
+  commit();
+  if (b.goal && n === b.goal) confetti();
   const msg = !b.goal ? `Block logged · ${n} today`
-    : n === b.goal ? `Goal reached · ${n} blocks ✓`
+    : n === b.goal ? `Goal reached · ${n} blocks 🎉`
     : n > b.goal ? `Block logged · ${n} today, goal met`
     : `Block logged · ${n} of ${b.goal}`;
   toast(msg, () => setFocusRecord(rec.id, { deleted: true }));
@@ -272,6 +309,174 @@ function deleteBlock(id) {
   if (openBlockId === id) openBlockId = null;
   updateBlock(id, { deleted: true });
   toast('Removed from blocks', () => updateBlock(id, { deleted: false }));
+}
+
+/* ---------- little celebrations: a pop of color when you check something off, confetti for the big ones ---------- */
+
+const calm = matchMedia('(prefers-reduced-motion: reduce)');
+const FX = ['--accent', '--pop-sun', '--pop-pink', '--pop-sky', '--pop-lilac', '--pop-coral'];
+const popped = new Set(); // rows just checked: their checkbox springs once
+let lastPoint = null;
+document.addEventListener('pointerup', e => { lastPoint = { x: e.clientX, y: e.clientY, at: Date.now() }; }, true);
+
+const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function fxLayer() {
+  let l = document.getElementById('fx');
+  if (!l) { l = document.createElement('div'); l.id = 'fx'; l.setAttribute('aria-hidden', 'true'); document.body.append(l); }
+  return l;
+}
+function spark(layer, x, y, color, bar) {
+  const p = document.createElement('i');
+  if (bar) p.className = 'bar';
+  p.style.cssText = `left:${x}px;top:${y}px;background:${color}`;
+  layer.append(p);
+  return p;
+}
+
+// a little ring of sparks where your finger (or cursor) just was
+function burst(color = null) {
+  if (calm.matches || !lastPoint || Date.now() - lastPoint.at > 1500) return;
+  const { x, y } = lastPoint;
+  const layer = fxLayer(), palette = FX.map(cssVar);
+  const N = 12;
+  for (let i = 0; i < N; i++) {
+    const a = (i / N) * Math.PI * 2 + Math.random() * 0.4;
+    const d = 22 + Math.random() * 22;
+    const p = spark(layer, x, y, i % 3 ? (color || palette[0]) : palette[1 + (i % (palette.length - 1))], i % 4 === 0);
+    p.animate([
+      { transform: 'translate(-50%, -50%) scale(1)', opacity: 1 },
+      { transform: `translate(calc(-50% + ${(Math.cos(a) * d).toFixed(1)}px), calc(-50% + ${(Math.sin(a) * d).toFixed(1)}px)) rotate(${Math.round(Math.random() * 300)}deg) scale(.3)`, opacity: 0 },
+    ], { duration: 480 + Math.random() * 220, easing: 'cubic-bezier(.15, .8, .3, 1)' }).onfinish = () => p.remove();
+  }
+}
+
+// the big one: a list finished, a goal hit
+function confetti() {
+  if (calm.matches) return;
+  const layer = fxLayer(), palette = FX.map(cssVar);
+  const W = innerWidth, H = innerHeight;
+  const ox = lastPoint && Date.now() - lastPoint.at < 1500 ? lastPoint.x : W / 2;
+  const oy = lastPoint && Date.now() - lastPoint.at < 1500 ? lastPoint.y : H * 0.4;
+  for (let i = 0; i < 70; i++) {
+    const p = spark(layer, ox, oy, palette[i % palette.length], i % 3 !== 0);
+    const vx = (Math.random() - 0.5) * Math.min(W, 700) * 0.9;
+    const up = -(80 + Math.random() * H * 0.3);
+    const spin = (Math.random() - 0.5) * 1080;
+    p.animate([
+      { transform: 'translate(-50%, -50%) rotate(0deg)', opacity: 1, easing: 'cubic-bezier(.15, .7, .35, 1)' },
+      { transform: `translate(calc(-50% + ${(vx * 0.55).toFixed(0)}px), calc(-50% + ${up.toFixed(0)}px)) rotate(${(spin * 0.4).toFixed(0)}deg)`, opacity: 1, offset: 0.32, easing: 'cubic-bezier(.45, 0, .85, .6)' },
+      { transform: `translate(calc(-50% + ${vx.toFixed(0)}px), calc(-50% + ${(H - oy + 40).toFixed(0)}px)) rotate(${spin.toFixed(0)}deg)`, opacity: 0.9 },
+    ], { duration: 1500 + Math.random() * 900, delay: Math.random() * 120 }).onfinish = () => p.remove();
+  }
+  haptic();
+}
+
+/* ---------- lists: plain running lists (groceries, pharmacy, …), no AI, no dates ---------- */
+
+// lists and their items are separate maps so two devices editing the same list merge item by item
+
+const liveLists = () => Object.values(data.lists).filter(l => !l.deleted).sort((a, b) => a.created - b.created);
+const listItems = lid => Object.values(data.listItems).filter(i => !i.deleted && i.listId === lid);
+// unchecked first, in the order you added them; checked ones sink to the bottom
+const sortListItems = arr => arr.sort((a, b) => (a.done - b.done) || (a.done ? (b.doneAt || 0) - (a.doneAt || 0) : a.created - b.created));
+
+// each list gets its own color and an emoji picked from its name (tap the emoji to change it)
+const LIST_HUES = ['--pop-pink', '--pop-sky', '--pop-sun', '--pop-lilac', '--accent', '--pop-coral'];
+const listHue = l => (l.hue ?? [...l.id].reduce((h, c) => h + c.charCodeAt(0), 0)) % LIST_HUES.length;
+const LIST_EMOJI = [
+  [/grocer|food|supermarket|market|trader|aldi|lidl|rewe|edeka|costco|whole ?foods/i, '🛒'],
+  [/pharm|drug|meds?\b|medicine|apothe|dm\b|cvs|walgreens/i, '💊'],
+  [/hardware|diy|tools?\b|home depot|bauhaus|ikea|fix/i, '🔨'],
+  [/pack|trip|travel|vacation|holiday|flight/i, '🧳'],
+  [/gift|present|birthday|christmas|xmas/i, '🎁'],
+  [/book|read/i, '📚'],
+  [/movie|film|watch|show|tv/i, '🎬'],
+  [/music|album|song|listen/i, '🎧'],
+  [/wine|liquor|beer|drink|bar\b/i, '🍷'],
+  [/clean|house|chore/i, '🧽'],
+  [/garden|plant/i, '🪴'],
+  [/pet|dog|cat\b/i, '🐾'],
+  [/cloth|outfit|wardrobe|mall/i, '👕'],
+  [/bake|baking|recipe|cook|dinner|meal/i, '🧁'],
+  [/party|bbq/i, '🎉'],
+  [/school|uni\b|class|study/i, '🎒'],
+  [/idea|someday/i, '💡'],
+];
+const EMOJI_CYCLE = ['📝', '🛒', '💊', '🔨', '🧳', '🎁', '📚', '🎬', '🍷', '🪴', '🐾', '👕', '🧁', '🎉', '🎒', '💡', '⭐'];
+const listEmoji = l => l.emoji || LIST_EMOJI.find(([rx]) => rx.test(l.name))?.[1] || '📝';
+
+function addList(name) {
+  name = name.trim();
+  if (!name) return null;
+  const t = now();
+  const used = new Set(liveLists().map(listHue));
+  const hue = [...LIST_HUES.keys()].find(h => !used.has(h)) ?? liveLists().length % LIST_HUES.length;
+  const l = { id: uid(), name, hue, created: t, updated: t };
+  data.lists[l.id] = l;
+  freshToday.add(l.id);
+  commit();
+  return l.id;
+}
+
+function updateList(id, patch) {
+  const l = data.lists[id];
+  if (!l) return;
+  data.lists[id] = { ...l, ...patch, updated: now() };
+  commit();
+}
+
+function setListItems(ids, patch) {
+  const t = now();
+  for (const id of ids) if (data.listItems[id]) data.listItems[id] = { ...data.listItems[id], ...patch, updated: t };
+  commit();
+}
+
+// "milk, eggs, bread" or several pasted lines add one item each
+function addListItems(lid, text) {
+  const parts = text.split(/\n|,(?!\d)/).map(s => s.trim().replace(/^[-*•·]\s*/, '')).filter(Boolean);
+  if (!parts.length || !data.lists[lid]) return;
+  let t = now();
+  for (const text of parts) {
+    const it = { id: uid(), listId: lid, text, done: false, doneAt: null, created: t, updated: t };
+    t += 1; // keep the order they were typed in
+    data.listItems[it.id] = it;
+    freshToday.add(it.id);
+  }
+  commit();
+}
+
+function toggleListItem(id) {
+  const it = data.listItems[id];
+  if (!it) return;
+  haptic();
+  const l = data.lists[it.listId];
+  if (!it.done) { popped.add(id); burst(l ? cssVar(LIST_HUES[listHue(l)]) : null); }
+  setListItems([id], { done: !it.done, doneAt: it.done ? null : now() });
+  const all = listItems(it.listId);
+  if (!it.done && all.length >= 2 && all.every(x => x.done)) { confetti(); toast(`${l?.name || 'List'}: got everything 🎉`); }
+}
+
+function deleteListItem(id) {
+  setListItems([id], { deleted: true });
+  toast('Removed', () => setListItems([id], { deleted: false }));
+}
+
+function clearChecked(lid) {
+  const ids = listItems(lid).filter(i => i.done).map(i => i.id);
+  if (!ids.length) return;
+  haptic();
+  setListItems(ids, { deleted: true });
+  toast(`Cleared ${ids.length} checked`, () => setListItems(ids, { deleted: false }));
+}
+
+function deleteList(id) {
+  const l = data.lists[id];
+  if (!l) return;
+  const ids = listItems(id).map(i => i.id);
+  menuListId = null;
+  setListItems(ids, { deleted: true });
+  updateList(id, { deleted: true });
+  toast(`Deleted ${l.name}`, () => { setListItems(ids, { deleted: false }); updateList(id, { deleted: false }); });
 }
 
 const briefDismissed = () => { try { return localStorage.getItem(LS.brief); } catch { return null; } };
@@ -669,6 +874,8 @@ function merge(a, b) {
     today: mergeMap(a.today, b.today),
     focus: mergeMap(a.focus, b.focus),
     blocks: mergeMap(a.blocks, b.blocks),
+    lists: mergeMap(a.lists, b.lists),
+    listItems: mergeMap(a.listItems, b.listItems),
     examples,
     briefing: newer(a.briefing, b.briefing),
   };
@@ -684,6 +891,8 @@ function differs(from, to) {
     || mapDiffers(from.today, to.today)
     || mapDiffers(from.focus, to.focus)
     || mapDiffers(from.blocks, to.blocks)
+    || mapDiffers(from.lists, to.lists)
+    || mapDiffers(from.listItems, to.listItems)
     || (from.examples || []).length !== to.examples.length
     || (from.briefing?.updated || 0) !== (to.briefing?.updated || 0);
 }
@@ -816,11 +1025,11 @@ function editor(it) {
 }
 
 const section = (name, items, showGroup = false) => items.length
-  ? `${name ? `<div class="section">${esc(name)} <span class="n">${items.length}</span></div>` : ''}<ul class="items">${items.map(i => card(i, showGroup)).join('')}</ul>`
+  ? `${name ? `<div class="section"><span class="section-name">${esc(name)}</span><span class="n">${items.length}</span></div>` : ''}<ul class="items">${items.map(i => card(i, showGroup)).join('')}</ul>`
   : '';
 
-function emptyState(title, sub) {
-  return `<div class="empty"><b>${esc(title)}</b>${esc(sub)}</div>`;
+function emptyState(title, sub, emoji = '🌱') {
+  return `<div class="empty"><span class="empty-emoji" aria-hidden="true">${emoji}</span><b>${esc(title)}</b>${esc(sub)}</div>`;
 }
 
 const DOTS = '<svg viewBox="0 0 10 16" aria-hidden="true"><circle cx="2.5" cy="3" r="1.4"/><circle cx="7.5" cy="3" r="1.4"/><circle cx="2.5" cy="8" r="1.4"/><circle cx="7.5" cy="8" r="1.4"/><circle cx="2.5" cy="13" r="1.4"/><circle cx="7.5" cy="13" r="1.4"/></svg>';
@@ -833,7 +1042,7 @@ function todayRow(e) {
     : `<div class="t-text" data-tact="edit">${esc(e.text)}${e.rolled ? `<span class="t-rolled" title="Carried over from an earlier day">↻</span>` : ''}${focusMinutes(e.id) ? `<span class="t-focus" title="Focused today">◷ ${fmtMinutes(focusMinutes(e.id))}</span>` : ''}</div>`;
   return `<li class="swipe-row t-wrap" data-id="${esc(e.id)}" data-list="today">
     <div class="swipe-bg" aria-hidden="true"><span class="sb-done">${e.done ? '↺ undo' : '✓ done'}</span><span class="sb-del">remove ✕</span></div>
-    <div class="t-row ${e.done ? 'done' : ''} ${freshToday.has(e.id) ? 'fresh' : ''}">
+    <div class="t-row ${e.done ? 'done' : ''} ${freshToday.has(e.id) ? 'fresh' : ''}${popped.has(e.id) ? ' pop' : ''}">
       <button class="t-check" data-tact="toggle" aria-label="${e.done ? 'Mark not done' : 'Mark done'}"></button>
       ${text}
       ${e.done || editTodayId === e.id ? '' : `<button class="t-timer" data-tact="focus" aria-label="Start a focus timer for this">${RING}</button>`}
@@ -841,6 +1050,13 @@ function todayRow(e) {
       <button class="t-handle" aria-label="Drag to reorder, or up into Blocks" title="Drag to reorder, or up into Blocks">${DOTS}</button>
     </div>
   </li>`;
+}
+
+// the Today card's greeting and sky follow the clock: sunrise peach, midday gold, dusk pink, night indigo
+function skyNow() {
+  const h = new Date().getHours();
+  return h < 5 ? ['night', 'Up late', '🌙'] : h < 12 ? ['dawn', 'Good morning', '☀️'] : h < 17 ? ['day', 'Good afternoon', '🌤️']
+    : h < 21 ? ['dusk', 'Good evening', '🌇'] : ['night', 'Good night', '🌙'];
 }
 
 function todayPanel() {
@@ -855,9 +1071,10 @@ function todayPanel() {
     ? `<div class="brief"><span class="brief-mark">✦</span><p>${esc(b.text)}</p><button class="brief-x" data-tact="dismiss-brief" aria-label="Dismiss briefing">✕</button></div>`
     : '';
 
-  return `<section class="today" aria-label="Today">
+  const [sky, hello, glyph] = skyNow();
+  return `<section class="today" data-sky="${sky}" aria-label="Today">
     <div class="today-head">
-      <span class="today-title">Today</span>
+      <span class="today-title"><span class="today-glyph" aria-hidden="true">${glyph}</span>${hello}</span>
       <span class="today-date">${esc(date)}</span>
       ${focusMinutes() ? `<span class="today-focus" title="Focused today">◷ ${fmtMinutes(focusMinutes())}</span>` : ''}
       ${entries.length ? `<span class="today-count${doneN === entries.length ? ' all' : ''}">${doneN}/${entries.length}</span>` : ''}
@@ -971,6 +1188,72 @@ function blockRow(b, i = 0) {
     </div>
     ${open ? blockDrawer(b, all) : ''}
   </li>`;
+}
+
+/* ---------- lists view ---------- */
+
+const LIST_STARTERS = ['groceries', 'pharmacy', 'hardware store', 'packing'];
+const CHEVRON = '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+function listItemRow(it) {
+  const text = editListItemId === it.id
+    ? `<input class="t-edit" data-liid="${esc(it.id)}" value="${esc(it.text)}" enterkeyhint="done" aria-label="Edit item">`
+    : `<div class="t-text" data-lact="edit">${esc(it.text)}</div>`;
+  return `<li class="swipe-row t-wrap l-wrap" data-id="${esc(it.id)}" data-list="lists">
+    <div class="swipe-bg" aria-hidden="true"><span class="sb-done">${it.done ? '↺ uncheck' : '✓ got it'}</span><span class="sb-del">remove ✕</span></div>
+    <div class="t-row l-row${it.done ? ' done' : ''}${freshToday.has(it.id) ? ' fresh' : ''}${popped.has(it.id) ? ' pop' : ''}">
+      <button class="t-check" data-lact="toggle" aria-label="${it.done ? 'Uncheck' : 'Check off'}"></button>
+      ${text}
+      <button class="t-del" data-lact="delete" aria-label="Remove item" title="Remove">✕</button>
+    </div>
+  </li>`;
+}
+
+function listCard(l, i) {
+  const items = sortListItems(listItems(l.id));
+  const left = items.filter(x => !x.done).length;
+  const checked = items.length - left;
+  const menu = menuListId === l.id;
+  const name = editListId === l.id
+    ? `<input class="t-edit l-rename" data-lid="${esc(l.id)}" value="${esc(l.name)}" enterkeyhint="done" aria-label="Rename list">`
+    : `<button type="button" class="l-name" data-lact="collapse" aria-expanded="${!l.collapsed}">${CHEVRON}<span>${esc(l.name)}</span></button>`;
+  const pct = items.length ? Math.round((checked / items.length) * 100) : 0;
+  return `<section class="l-card${l.collapsed ? ' collapsed' : ''}${freshToday.has(l.id) ? ' fresh' : ''}${items.length && !left ? ' complete' : ''}" data-lid="${esc(l.id)}" style="--lc:var(${LIST_HUES[listHue(l)]})">
+    <header class="l-head">
+      <button type="button" class="l-emoji" data-lact="emoji" aria-label="Change icon" title="Change icon">${listEmoji(l)}</button>
+      ${name}
+      <span class="l-count${items.length && !left ? ' all' : ''}">${!items.length ? 'empty' : !left ? 'all done' : `${left} left`}</span>
+      <button type="button" class="l-more${menu ? ' on' : ''}" data-lact="menu" aria-label="List options" aria-expanded="${menu}">⋯</button>
+    </header>
+    ${items.length && !l.collapsed ? `<div class="l-prog" aria-hidden="true"><i style="width:${pct}%"></i></div>` : ''}
+    ${menu ? `<div class="l-menu">
+      <button type="button" data-lact="rename">rename</button>
+      ${checked ? `<button type="button" data-lact="clear">clear ${checked} checked</button>` : ''}
+      ${checked ? `<button type="button" data-lact="uncheck-all">uncheck all</button>` : ''}
+      <button type="button" class="b-remove" data-lact="delete-list">delete list</button>
+    </div>` : ''}
+    ${l.collapsed ? '' : `<ul class="t-list l-items">${items.map(listItemRow).join('')}</ul>
+    <form class="t-add l-add" data-lid="${esc(l.id)}" autocomplete="off">
+      <span class="t-plus" aria-hidden="true">+</span>
+      <input class="l-add-input" data-lid="${esc(l.id)}" placeholder="${items.length ? 'add item' : 'add items, commas for several'}" enterkeyhint="done" aria-label="Add to ${esc(l.name)}">
+    </form>
+    ${checked && !menu ? `<button type="button" class="l-clear" data-lact="clear">clear ${checked} checked</button>` : ''}`}
+  </section>`;
+}
+
+function listsView() {
+  const lists = liveLists();
+  const used = new Set(lists.map(l => l.name.toLowerCase()));
+  const starters = LIST_STARTERS.filter(n => !used.has(n));
+  return `<div class="lists">
+    ${lists.length ? lists.map(listCard).join('') : `<div class="empty"><span class="empty-emoji" aria-hidden="true">🛒</span><b>No lists yet</b>running lists for the store, the pharmacy, a trip</div>`}
+    <form class="l-new" id="lNew" autocomplete="off">
+      <span class="t-plus" aria-hidden="true">+</span>
+      <input id="lNewInput" placeholder="new list" enterkeyhint="done" aria-label="New list name">
+    </form>
+    ${starters.length && lists.length < 3 ? `<div class="t-suggest l-starters">${starters.map(n =>
+      `<button type="button" class="t-chip" data-lact="starter" data-name="${esc(n)}">+ ${esc(n)}</button>`).join('')}</div>` : ''}
+  </div>`;
 }
 
 /* ---------- the day ring: a 24-hour dial with a lane per block task ---------- */
@@ -1092,13 +1375,16 @@ function dayHero(blocks) {
 // the box at the top of Today: the work your day is built around
 function blocksSection() {
   const blocks = liveBlocks();
+  const recent = recentBlocks(blocks.length ? 3 : 4);
   return `<div class="b-sec${blocks.length ? '' : ' empty'}" aria-label="Blocks">
     ${blocks.length ? dayHero(blocks) : `<div class="b-head"><span class="b-title">${RING}blocks</span></div>`}
     ${blocks.length ? `<ul class="b-list">${blocks.map(blockRow).join('')}</ul>` : ''}
     <form class="t-add b-add" id="bAdd" autocomplete="off">
       <span class="t-plus" aria-hidden="true">+</span>
-      <input id="bAddInput" placeholder="add, or drag a task up here" enterkeyhint="done" aria-label="Add something to track in blocks">
+      <input id="bAddInput" placeholder="${blocks.length ? 'add, or drag a task up here' : 'plan today’s blocks'}" enterkeyhint="done" aria-label="Add something to track in blocks">
     </form>
+    ${recent.length ? `<div class="t-suggest b-recent"><span class="t-suggest-label">${blocks.length ? 'again' : 'last time'}</span>${recent.map(b =>
+      `<button type="button" class="t-chip" data-bact="again" data-next="${esc(b.id)}" title="Add ${esc(b.name)} to today’s blocks${b.goal ? `, ${b.goal} blocks` : ''}">+ ${esc(b.name)}${b.goal ? `<small>×${b.goal}</small>` : ''}</button>`).join('')}</div>` : ''}
   </div>`;
 }
 
@@ -1110,12 +1396,15 @@ function renderList() {
 
   // keep whatever is being typed in the today list across re-renders (e.g. a sync landing)
   const active = document.activeElement;
-  const keep = active?.id === 'tAddInput' || active?.id === 'bAddInput' ? { sel: '#' + active.id, value: active.value }
+  const keep = ['tAddInput', 'bAddInput', 'lNewInput'].includes(active?.id) ? { sel: '#' + active.id, value: active.value }
+    : active?.classList?.contains('l-add-input') ? { sel: `.l-add-input[data-lid="${active.dataset.lid}"]`, value: active.value }
     : active?.classList?.contains('t-edit') ? { sel: '.t-edit', value: active.value } : null;
 
-  if (view === 'done') {
+  if (view === 'lists') {
+    html = listsView();
+  } else if (view === 'done') {
     const done = all.filter(i => i.done).sort((a, b) => (b.doneAt || 0) - (a.doneAt || 0)).slice(0, 150);
-    html = done.length ? section('', done, true) : emptyState('Nothing finished yet', 'checked-off things settle here');
+    html = done.length ? section('', done, true) : emptyState('Nothing finished yet', 'checked-off things settle here', '🏁');
   } else if (view === 'today') {
     const quick = open.filter(i => !(i.due && i.due <= t) && i.size === 'quick' && i.kind !== 'idea').sort(sortOpen).slice(0, 8);
     html = todayPanel() + section('Quick wins', quick, true);
@@ -1131,8 +1420,8 @@ function renderList() {
       .sort((a, b) => Math.max(...b[1].map(i => i.updated)) - Math.max(...a[1].map(i => i.updated)));
     html = section(ordered.length || view === 'all' ? 'Inbox' : '', loose) + ordered.map(([g, arr]) => section(g, arr.sort(sortOpen))).join('');
     if (!html) html = view === 'all'
-      ? emptyState('Inbox is empty', 'throw something in above')
-      : emptyState(`No ${KINDS[view].label.toLowerCase()} items`, 'they show up here once you add some');
+      ? emptyState('Inbox zero', 'nothing waiting on you. throw something in above', '🌿')
+      : emptyState(`No ${KINDS[view].label.toLowerCase()} items`, 'they show up here once you add some', KINDS[view].glyph);
     if (view === 'all') html = todayPanel() + html;
   }
 
@@ -1141,7 +1430,7 @@ function renderList() {
     const el = $(keep.sel);
     if (el) { el.value = keep.value; el.focus(); }
   }
-  if (fresh.size || freshToday.size) setTimeout(() => { fresh.clear(); freshToday.clear(); }, 700);
+  if (fresh.size || freshToday.size || popped.size) setTimeout(() => { fresh.clear(); freshToday.clear(); popped.clear(); }, 700);
 }
 
 function renderChips() {
@@ -1150,11 +1439,12 @@ function renderChips() {
   const counts = {
     all: open.length,
     today: liveToday().filter(e => !e.done).length,
+    lists: Object.values(data.listItems).filter(i => !i.deleted && !i.done && data.lists[i.listId] && !data.lists[i.listId].deleted).length,
     done: all.filter(i => i.done).length,
   };
   for (const k of Object.keys(KINDS)) counts[k] = open.filter(i => i.kind === k).length;
 
-  const defs = [['all', 'All'], ['today', 'Today'], ...Object.entries(KINDS).map(([k, v]) => [k, v.short, v.glyph]), ['done', 'Done']]
+  const defs = [['all', 'All'], ['today', 'Today'], ['lists', 'Lists'], ...Object.entries(KINDS).map(([k, v]) => [k, v.short, v.glyph]), ['done', 'Done']]
     .filter(([key]) => !KINDS[key] || counts[key] || view === key);
   $('#chips').innerHTML = defs.map(([key, label, glyph]) =>
     `<button class="chip ${view === key ? 'on' : ''} ${counts[key] ? '' : 'zero'}" data-view="${key}" ${glyph ? `style="--kc:var(--k-${key})"` : ''}>
@@ -1284,6 +1574,7 @@ function completeItem(id, row) {
   if (!it) return;
   haptic();
   if (!it.done) {
+    burst(cssVar(`--k-${it.kind}`));
     row?.classList.add('leaving');
     setTimeout(() => update(id, { done: true, doneAt: now() }), row ? 420 : 0);
     toast('Done', () => update(id, { done: false, doneAt: null }));
@@ -1412,6 +1703,12 @@ $('#list').addEventListener('click', e => {
     case 'length':
       updateBlock(id, { minutes: +el.dataset.min });
       return;
+    case 'again': {
+      const b = data.blocks[id];
+      haptic();
+      addBlock(b.name, b.goal || null);
+      return;
+    }
     case 'edit':
       editBlockId = id;
       renderList();
@@ -1422,6 +1719,129 @@ $('#list').addEventListener('click', e => {
       return;
   }
 });
+
+/* ---------- events: lists ---------- */
+
+const focusEnd = inp => { inp?.focus(); inp?.setSelectionRange(inp.value.length, inp.value.length); };
+
+$('#list').addEventListener('click', e => {
+  if (suppressClick) return;
+  const el = e.target.closest('[data-lact]');
+  if (!el) return;
+  const act = el.dataset.lact;
+  if (act === 'starter') {
+    const id = addList(el.dataset.name);
+    requestAnimationFrame(() => $(`.l-add-input[data-lid="${id}"]`)?.focus());
+    return;
+  }
+  const lid = el.closest('.l-card')?.dataset.lid;
+  const iid = el.closest('[data-list=lists]')?.dataset.id;
+  const l = lid && data.lists[lid];
+  if (!l) return;
+
+  switch (act) {
+    case 'toggle':
+      toggleListItem(iid);
+      return;
+    case 'edit':
+      editListItemId = iid;
+      renderList();
+      focusEnd($('.t-edit'));
+      return;
+    case 'delete':
+      deleteListItem(iid);
+      return;
+    case 'emoji': {
+      const cur = listEmoji(l);
+      const next = EMOJI_CYCLE[(EMOJI_CYCLE.indexOf(cur) + 1) % EMOJI_CYCLE.length];
+      haptic();
+      updateList(lid, { emoji: next });
+      return;
+    }
+    case 'collapse':
+      menuListId = null;
+      updateList(lid, { collapsed: !l.collapsed });
+      return;
+    case 'menu':
+      menuListId = menuListId === lid ? null : lid;
+      renderList();
+      return;
+    case 'rename':
+      menuListId = null;
+      editListId = lid;
+      renderList();
+      { const inp = $('.l-rename'); inp?.focus(); inp?.select(); }
+      return;
+    case 'clear':
+      menuListId = null;
+      clearChecked(lid);
+      return;
+    case 'uncheck-all': {
+      menuListId = null;
+      const ids = listItems(lid).filter(i => i.done).map(i => i.id);
+      setListItems(ids, { done: false, doneAt: null });
+      toast(`Unchecked ${ids.length}`, () => setListItems(ids, { done: true, doneAt: now() }));
+      return;
+    }
+    case 'delete-list':
+      deleteList(lid);
+      return;
+  }
+});
+
+$('#list').addEventListener('submit', e => {
+  const form = e.target;
+  if (form.id === 'lNew') {
+    e.preventDefault();
+    const inp = $('#lNewInput');
+    const id = addList(inp.value);
+    if (!id) return;
+    inp.value = '';
+    $(`.l-add-input[data-lid="${id}"]`)?.focus(); // straight into adding items
+    return;
+  }
+  if (!form.classList.contains('l-add')) return;
+  e.preventDefault();
+  const lid = form.dataset.lid;
+  const inp = form.querySelector('input');
+  if (!inp.value.trim()) return;
+  const text = inp.value;
+  inp.value = '';
+  addListItems(lid, text);
+  $(`.l-add-input[data-lid="${lid}"]`)?.focus(); // keep the keyboard up for the next one
+});
+
+// pasting a list (one per line) adds every line
+$('#list').addEventListener('paste', e => {
+  if (!e.target.classList?.contains('l-add-input')) return;
+  const text = e.clipboardData?.getData('text') || '';
+  if (!text.includes('\n')) return;
+  e.preventDefault();
+  const lid = e.target.dataset.lid;
+  addListItems(lid, text);
+  $(`.l-add-input[data-lid="${lid}"]`)?.focus();
+});
+
+function finishListEdit(inp, save) {
+  if (inp.dataset.liid) {
+    const id = inp.dataset.liid;
+    if (editListItemId !== id) return;
+    editListItemId = null;
+    const text = inp.value.trim();
+    const it = data.listItems[id];
+    if (save && it && text && text !== it.text) setListItems([id], { text });
+    else if (save && it && !text) deleteListItem(id);
+    else renderList();
+    return;
+  }
+  const id = inp.dataset.lid;
+  if (editListId !== id) return;
+  editListId = null;
+  const name = inp.value.trim();
+  const l = data.lists[id];
+  if (save && l && name && name !== l.name) updateList(id, { name });
+  else renderList();
+}
 
 /* drag across a task's slots to plan more or fewer blocks (mouse or touch) */
 
@@ -1544,7 +1964,8 @@ $('#list').addEventListener('keydown', e => {
 });
 $('#list').addEventListener('focusout', e => {
   if (!e.target.classList.contains('t-edit')) return;
-  if (e.target.dataset.bid) finishBlockEdit(e.target, !e.target.dataset.cancel);
+  if (e.target.dataset.liid || e.target.dataset.lid) finishListEdit(e.target, !e.target.dataset.cancel);
+  else if (e.target.dataset.bid) finishBlockEdit(e.target, !e.target.dataset.cancel);
   else finishTodayEdit(e.target, !e.target.dataset.cancel);
 });
 
@@ -1693,6 +2114,10 @@ function endDrag(e) {
       if (d.dx > 0) logBlock(id, data.blocks[id]?.minutes || DEFAULT_BLOCK); else deleteBlock(id);
       return;
     }
+    if (d.row.dataset.list === 'lists') {
+      if (d.dx > 0) toggleListItem(id); else deleteListItem(id);
+      return;
+    }
     if (d.row.dataset.list === 'today') {
       if (d.dx > 0) toggleToday(id); else deleteToday(id);
       return;
@@ -1728,6 +2153,7 @@ $('#list').addEventListener('change', e => {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && openId && !$('#settings').open) { openId = null; renderList(); }
   if (e.key === 'Escape' && openBlockId && !$('#settings').open) { openBlockId = null; renderList(); }
+  if (e.key === 'Escape' && menuListId && !$('#settings').open) { menuListId = null; renderList(); }
   if (e.key === '/' && document.activeElement === document.body) { e.preventDefault(); input.focus(); }
 });
 

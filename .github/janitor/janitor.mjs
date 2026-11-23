@@ -77,6 +77,8 @@ function merge(a, b) {
     today: mergeMap(a.today, b.today),
     focus: mergeMap(a.focus, b.focus),
     blocks: mergeMap(a.blocks, b.blocks),
+    lists: mergeMap(a.lists, b.lists),
+    listItems: mergeMap(a.listItems, b.listItems),
     briefing: newer(a.briefing, b.briefing),
   };
 }
@@ -114,7 +116,7 @@ function tidy(data, archive, t = Date.now()) {
   }
 
   // tombstones only need to live long enough for every device to see them
-  for (const map of [data.items, data.today]) {
+  for (const map of [data.items, data.today, data.lists || {}, data.listItems || {}]) {
     for (const [id, x] of Object.entries(map)) {
       if (x.deleted && x.updated < t - TOMBSTONE_DAYS * DAY_MS) { delete map[id]; stats.purgedTombstones++; }
     }
